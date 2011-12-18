@@ -1,0 +1,399 @@
+#!/bin/bash
+
+# mkinitrd
+#
+# Written by Erik Troan <ewt@redhat.com>
+#
+# Contributors:
+#	Elliot Lee <sopwith@cuc.edu>
+#	Miguel de Icaza <miguel@nuclecu.unam.mx>
+#	Christian 'Dr. Disk' Hechelmann <drdisk@ds9.au.s.shuttle.de>
+#	Michael K. Johnson <johnsonm@redhat.com>
+#	Pierre Habraken <Pierre.Habraken@ujf-grenoble.fr>
+#	Jakub Jelinek <jj@ultra.linux.cz>
+#	Carlo Arenas Belon (carenas@chasqui.lared.net.pe>
+#	Keith Owens <kaos@ocs.com.au>
+
+PATH=/sbin:$PATH
+export PATH
+
+VERSION=2.6
+
+compress=1
+target=""
+kernel=""
+force=""
+verbose=""
+MODULES=""
+basicmodules="-pagebuf -xfs_support -xfs"
+img_vers=""
+modulefile=/etc/modules.conf
+
+#if [ `uname -m` = "ia64" ]; then
+#  IMAGESIZE=3000
+#else
+#  IMAGESIZE=1500
+#fi
+
+IMAGESIZE=25000
+
+PRESCSIMODS="scsi_mod sd_mod unknown"
+fstab="/etc/fstab"
+
+usage () {
+    echo "usage: `basename $0` [--version] [-v] [-f] [--ifneeded] [--preload <module>]" >&2
+    echo "       [--omit-scsi-modules] [--omit-raid-modules] [--with=<module>]" >&2
+    echo "       [--image-version] [--fstab=<fstab>] [--nocompress] <initrd-image>" >&2
+    echo "       <kernel-version>" >&2
+    echo "       (ex: `basename $0` /boot/initrd-2.2.5-15.img 2.2.5-15)" >&2
+    exit 1
+}
+
+findmodule() {
+    skiperrors=""
+    modName=$1
+    if [ $(echo $modName | cut -b1) = "-" ]; then
+	skiperrors=1
+	modName=$(echo $modName | cut -b2-)
+    fi
+
+    if [ "$modName" = "pluto" ]; then
+	findmodule fc4
+	findmodule soc
+    fi
+    if [ "$modName" = "fcal" ]; then
+	findmodule fc4
+	findmodule socal
+    fi
+
+    fmPath=`(cd /lib/modules/$kernel; find -type f -name $modName.o)`
+
+    if [ ! -f /lib/modules/$kernel/$fmPath ]; then
+	if [ -n "$skiperrors" ]; then
+	    return
+	fi
+
+        # ignore the absence of the scsi modules
+	for n in $PRESCSIMODS; do
+	    if [ "$n" = "$modName" ]; then
+		return;
+	    fi
+	done;
+    
+	echo "No module $modName found for kernel $kernel" >&2
+	exit 1
+    fi
+
+    # only need to add each module once
+    if echo $MODULES | grep $fmPath >/dev/null 2>&1 ; then : ; else
+	MODULES="$MODULES $fmPath"
+    fi
+}
+
+inst() {
+    if [ "$#" != "2" ];then
+        echo "usage: inst <file> <destination>"
+        return
+    fi 
+    [ -n "$verbose" ] && echo "$1 -> $2"
+    cp $1 $2
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+	--fstab*)
+	    if echo $1 | grep '=' >/dev/null ; then
+	    	fstab=`echo $1 | sed 's/^--fstab=//'`
+	    else
+		fstab=$2
+		shift
+	    fi		    
+	    ;;
+
+	--with*)
+	    if echo $1 | grep '=' >/dev/null ; then
+	    	modname=`echo $1 | sed 's/^--with=//'`
+	    else
+		modname=$2
+		shift
+	    fi		    
+
+	    basicmodules="$basicmodules $modname"
+	    ;;
+
+	--version)
+	    echo "mkinitrd: version $VERSION"
+	    exit 0
+	    ;;
+
+	-v)
+	    verbose=-v
+	    ;;
+
+	--nocompress)
+	    compress=""
+	    ;;
+
+	--ifneeded)
+	    ifneeded=1
+	    ;;
+
+	-f)
+	    force=1
+	    ;;
+	--preload)
+	    if echo $1 | grep '=' >/dev/null ; then
+	    	modname=`echo $1 | sed 's/^--preload=//'`
+	    else
+		modname=$2
+		shift
+	    fi		    
+	    PREMODS="$PREMODS $modname"
+	    ;;
+	--omit-scsi-modules)
+	    PRESCSIMODS=""
+	    noscsi=1;
+	    ;;
+	--omit-raid-modules)
+	    noraid=1;
+	    ;;
+	--image-version)
+	    img_vers=yes
+	    ;;
+	*)
+	    if [ -z "$target" ]; then
+		target=$1
+	    elif [ -z "$kernel" ]; then
+		kernel=$1
+	    else
+		usage
+	    fi
+	    ;;
+    esac
+
+    shift
+done
+
+if [ -z "$target" -o -z "$kernel" ]; then
+    usage
+fi
+
+if [ -n "$img_vers" ]; then
+    target="$target-$kernel"
+fi
+
+if [ -z "$force" -a -f $target ]; then
+    echo "$target already exists." >&2
+    exit 1
+fi
+
+if [ ! -d /lib/modules/$kernel ]; then
+    echo "/lib/modules/$kernel is not a directory." >&2
+    exit 1
+fi
+
+for n in $PREMODS; do
+	findmodule $n
+done
+
+if [ -z "$noscsi" ]; then
+    for n in $PRESCSIMODS; do
+	    findmodule $n
+    done
+
+    if [ ! -f $modulefile ]; then
+        modulefile=/etc/conf.modules
+    fi
+
+    if [ -f $modulefile ]; then
+	scsimodules=`grep scsi_hostadapter $modulefile | grep -v '^[ 	]*#' | LC_ALL=C sort -u | awk '{ print $3 }'`
+	for n in $scsimodules; do
+    # for now allow scsi modules to come from anywhere.  There are some
+    # RAID controllers with drivers in block/
+	    findmodule $n
+	done
+    fi
+fi
+
+# If we have ide devices and module ide, do the right thing
+ide=/proc/ide/ide*
+if [ -n "$ide" ]; then
+    findmodule -ide-mod
+    findmodule -ide-probe-mod
+    findmodule -ide-disk
+fi
+
+if [ -z "$noraid" ]; then
+    # load appropriate raid devices if necessary
+    if grep '^/dev/md' $fstab | grep -v noauto >/dev/null 2>&1 ; then
+	for number in $(grep '^[ 	]*raid-level' /etc/raidtab |
+			  awk '{print $2}' | LC_ALL=C sort -u) ; do
+	    case $number in
+	    [0145])
+		findmodule raid$number
+		;;
+	    *)
+		echo "raid level $number (in /etc/raidtab) not recognized" >&2
+		;;
+	    esac
+	done
+    fi
+fi
+
+# check to see if we need to set up a loopback filesystem
+rootdev=$(awk '{ if ($2 == "/") { print $1; }}' $fstab)
+if echo $rootdev | cut -d/ -f3 | grep loop >/dev/null; then
+    key="^# $(echo $rootdev | cut -d/ -f3 | tr '[a-z]' '[A-Z]'):"
+    if ! grep "$key" $fstab > /dev/null; then
+	echo "The root filesystem is on a $rootdev, but there is no magic entry in $fstab" 1>&2
+	echo "for this device. Consult the mkinitrd man page for more information" 2>&2
+	exit 1
+    fi
+
+    line=$(grep "$key" $fstab)
+    loopDev=$(echo $line | awk '{print $3}')
+    loopFs=$(echo $line | awk '{print $4}')
+    loopFile=$(echo $line | awk '{print $5}')
+
+    basicmodules="$basicmodules -loop"
+    if [ "$loopFs" = "vfat" -o "$loopFs" = "msdos" ]; then
+	basicmodules="$basicmodules -fat"
+    fi
+    basicmodules="$basicmodules -${loopFs}"
+	
+fi
+
+for n in $basicmodules; do 
+    findmodule $n
+done
+
+if [ -n "$ifneeded" -a -z "$MODULES" ]; then
+    if [ -n "$verbose" ]; then
+	echo "No modules are needed -- not building initrd image."
+    fi
+    exit 0
+fi
+
+if [ -n "$verbose" ]; then
+    echo "Using modules: $MODULES"
+fi
+
+MNTIMAGE=/tmp/initrd.$$
+IMAGE=/tmp/initrd.img-$$
+MNTPOINT=/tmp/initrd.mnt-$$
+RCFILE=$MNTIMAGE/linuxrc
+
+if [ -f $MNTIMAGE ]; then
+    echo "$MNTIMAGE already exists.  Remove it and try again" >&2
+    exit 1
+fi
+
+if [ -f $IMAGE ]; then
+    echo "$IMAGE already exists. Remove it and try again" >&2
+    exit 1
+fi
+
+dd if=/dev/zero of=$IMAGE bs=1k count=$IMAGESIZE 2> /dev/null
+
+if [ -e /dev/.devfsd ]; then
+	LOOPDEV=/dev/loop/
+else
+	LOOPDEV=/dev/loop
+fi
+
+for devnum in 0 1 2 3 4 5 6 7 8; do
+    if losetup ${LOOPDEV}${devnum} $IMAGE 2>/dev/null ; then break; fi
+done
+
+if [ "$devnum" = "8" ]; then
+    rm -rf $MNTPOINT $IMAGE
+    echo "All of your loopback devices are in use!" >&2
+    exit 1
+fi
+
+LODEV=${LOOPDEV}${devnum}
+
+# We have to "echo y |" so that it doesn't complain about $IMAGE not
+# being a block device
+echo y | mke2fs $LODEV $IMAGESIZE >/dev/null 2>/dev/null
+
+if [ -n "$verbose" ]; then
+    echo "Using loopback device $LODEV"
+fi
+
+mkdir -p $MNTPOINT
+mount -t ext2 $LODEV $MNTPOINT || {
+	echo "Can't get a loopback device"
+	exit 1
+}
+
+mkdir -p $MNTIMAGE
+mkdir -p $MNTIMAGE/lib
+mkdir -p $MNTIMAGE/bin
+mkdir -p $MNTIMAGE/etc
+mkdir -p $MNTIMAGE/dev
+mkdir -p $MNTIMAGE/loopfs
+
+# We don't need this directory, so let's save space
+rm -rf $MNTPOINT/lost+found
+
+inst /sbin/sash "$MNTIMAGE/bin/sash"
+inst /sbin/insmod.static "$MNTIMAGE/bin/insmod"
+
+for MODULE in $MODULES; do
+    cp $verbose -a /lib/modules/$kernel/$MODULE $MNTIMAGE/lib
+done
+
+# mknod'ing the devices instead of copying them works both with and
+# without devfs...
+mknod $MNTIMAGE/dev/console c 5 1
+mknod $MNTIMAGE/dev/null c 1 3
+mknod $MNTIMAGE/dev/ram b 1 1
+mknod $MNTIMAGE/dev/systty c 4 0
+for i in 1 2 3 4; do
+    mknod $MNTIMAGE/dev/tty$i c 4 1
+done
+
+echo "#!/bin/sash" > $RCFILE
+echo "" >> $RCFILE
+echo "aliasall" >> $RCFILE
+echo "" >> $RCFILE
+
+for MODULE in $MODULES; do
+    module=`echo $MODULE | sed "s|.*/||" | sed "s/.o$//"`
+
+    options=`sed -n -e "s/^options[ 	][ 	]*$module[ 	][ 	]*//p" $modulefile`
+
+    if [ -n "$verbose" ]; then
+        echo "Loading module $module with options $options"
+    fi
+    echo "echo \"Loading $module module\"" >> $RCFILE
+    echo "insmod /lib/$module.o $options" >> $RCFILE
+done
+
+if [ -n "$loopDev" ]; then
+    if [ ! -d /initrd ]; then
+	mkdir /initrd
+    fi
+
+    cp -a $loopDev $MNTIMAGE/dev
+    cp -a $rootdev $MNTIMAGE/dev
+    echo "echo Mounting device containing loopback root filesystem" >> $RCFILE
+    echo "mount -t $loopFs $loopDev /loopfs" >> $RCFILE
+    echo "echo Setting up loopback device $rootdev" >> $RCFILE
+    echo "losetup $rootdev /loopfs$loopFile" >> $RCFILE
+fi
+
+chmod +x $RCFILE
+
+(cd $MNTIMAGE; tar cf - .) | (cd $MNTPOINT; tar xf -)
+
+umount $MNTPOINT
+losetup -d $LODEV
+
+if [ -n "$compress" ]; then
+    gzip -9 < $IMAGE > $target
+else
+    cp -a $IMAGE $target
+fi
+rm -rf $MNTIMAGE $MNTPOINT $IMAGE

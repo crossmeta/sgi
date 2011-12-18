@@ -1,0 +1,9 @@
+dmapi (0.1.0) unstable; urgency=low
+
+  * Initial release.
+
+ -- Nathan Scott <nathans@debian.org>  Thu,  4 Jan 2001 11:15:11 -0500
+
+Local variables:
+mode: debian-changelog
+End:

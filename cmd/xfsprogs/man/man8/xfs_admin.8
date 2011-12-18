@@ -1,0 +1,68 @@
+.TH xfs_admin 8
+.SH NAME
+xfs_admin \- change parameters of an XFS filesystem
+.SH SYNOPSIS
+.nf
+\f3xfs_admin\f1 [ \f3-lu\f1] [ \f3\-L \f2label\f1 ] [ \f3\-U \f2uuid\f1 ] device
+\f3xfs_admin \-f\f1 [ \f3-lu\f1] [ \f3\-L \f2label\f1 ] [ \f3\-U \f2uuid\f1 ] filename
+.fi
+.SH DESCRIPTION
+.I xfs_admin
+uses the
+.IR xfs_db (8)
+command to modify various parameters of a filesystem.
+.PP
+Devices that are mounted cannot be modified.
+Administrators must unmount filesystems before
+.I xfs_admin
+or
+.I xfs_db
+can convert parameters.
+A number of parameters of a mounted filesystem can be examined
+and modified using the
+.IR xfs_growfs (8)
+command.
+.SH OPTIONS
+.TP 5
+\f3\-f\f1
+Specifies that the filesystem image to be processed is stored in a
+regular file (see the \f2mkfs.xfs\f1 \f3\-d\f1 \f2file\f1 option).
+.TP 5
+\f3\-l\f1
+Print the current filesystem label.
+.TP 5
+\f3\-u\f1
+Print the current filesystem UUID (Universally Unique IDentifier).
+.TP 5
+\f3\-L\f1 \f2label\f1
+Set the filesystem label.
+XFS filesystem labels can be at most 12 characters long; if
+.I label
+is longer than 12 characters,
+.I xfs_admin
+will truncate it and print a warning message.
+The filesystem label can be cleared using the special ``\c
+.BR \-\- ''
+value for
+.IR label .
+.TP 5
+\f3\-U\f1 \f2UUID\f1
+Set the UUID of the filesystem.
+A sample UUID looks like this: "c1b9d5a2-f162-11cf-9ece-0020afc76f16".
+The uuid may also be
+.IR null ,
+which will set the filesystem UUID to the null UUID.
+The uuid may also be
+.IR generate ,
+which will generate a new UUID for the filesystem.
+.PP
+The
+.IR mount (8)
+manual entry describes how to mount a filesystem using its label or UUID,
+rather than its block special device name.
+.SH SEE ALSO
+mkfs.xfs(8),
+mount(8),
+xfs_db(8),
+xfs_growfs(8),
+xfs(5).

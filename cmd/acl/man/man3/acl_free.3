@@ -1,0 +1,14 @@
+.TH ACL_FREE 3
+.SH NAME
+acl_free \- free allocated memory
+.SH SYNOPSIS
+.B #include <sys/acl.h>
+.PP
+.B int acl_free( void *obj_p);
+.SH DESCRIPTION
+Free memory allocated by ACL interface calls.
+This routine is present for POSIX compliance, it is simply a wrapper
+for \f2free\fP(3c).
+.SH RETURN VALUES
+.I acl_free
+returns 0.

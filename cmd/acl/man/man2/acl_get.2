@@ -1,0 +1,64 @@
+'\"macro stdmacro
+.TH ACL_GET 2
+.SH NAME
+acl_get \- get an XFS access or default ACL
+.Op c p a
+.SH C SYNOPSIS
+.PP
+.sp
+.nf
+.B #include <sys/acl.h>
+.sp
+.B "int acl_get (const char *path, int fd, struct acl *acl,"
+.B "             struct acl *dacl);"
+.Op
+.SH DESCRIPTION
+The
+.I acl_get
+system call allows a user to retrieve an access or default ACL for
+a file/directory given either a file descriptor or path name.
+The
+.I path
+argument and
+.I fd
+argument provide alternate ways to specify the same file.
+The
+.I acl
+argument refers to the access ACL and should be preallocated.
+The
+.I dacl
+argument refers to the default ACL and should be preallocated.
+.P
+This system call is called from the POSIX ACL functions
+of 
+.br 
+acl_get_fd (3)
+and
+.br
+acl_get_file (3).
+Therefore, direct calling of this system call is not necessary
+or suggested.
+.SH CAVEAT
+This ACL system call can be considered a temporary prototype solution
+and may be altered for a more generic ACL solution in the future.
+.SH DIAGNOSTICS
+.I acl_get
+will return 0 on success, and a negated error code on any failure.
+.PP
+.B -EINVAL
+.IP
+Invalid arguments such as 
+.I acl
+and
+.I dacl
+both being NULL, or
+.I fd
+and
+.I path
+either both NULL or both not NULL.
+.SH "SEE ALSO"
+acl(5),
+.br
+acl_get_fd(3), acl_get_file(3),
+.br
+chacl(1).

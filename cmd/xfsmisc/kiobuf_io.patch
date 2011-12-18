@@ -1,0 +1,2958 @@
+
+===========================================================================
+Index: linux/drivers/block/elevator.c
+===========================================================================
+
+--- linux/drivers/block/elevator.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/block/elevator.c_1.7	Tue Apr  3 17:57:09 2001
+@@ -94,6 +94,8 @@
+ 
+ 		if (__rq->sem)
+ 			continue;
++		if (__rq->kiobuf)
++			continue;
+ 		if (__rq->rq_dev != bh->b_rdev)
+ 			continue;
+ 		if (!*req && bh_rq_in_between(bh, __rq, &q->queue_head))
+@@ -155,7 +157,8 @@
+ 	entry = &q->queue_head;
+ 	while ((entry = entry->prev) != head) {
+ 		struct request *__rq = blkdev_entry_to_request(entry);
+-
++		if (__rq->kiobuf)
++			continue;
+ 		if (__rq->cmd != rw)
+ 			continue;
+ 		if (__rq->rq_dev != bh->b_rdev)
+
+===========================================================================
+Index: linux/drivers/block/ll_rw_blk.c
+===========================================================================
+
+--- linux/drivers/block/ll_rw_blk.c	Tue Apr  3 17:47:19 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/block/ll_rw_blk.c_1.65	Tue Apr  3 17:57:09 2001
+@@ -6,6 +6,7 @@
+  * Elevator latency, (C) 2000  Andrea Arcangeli <andrea@suse.de> SuSE
+  * Queue request tables / lock, selectable elevator, Jens Axboe <axboe@suse.de>
+  * kernel-doc documentation started by NeilBrown <neilb@cse.unsw.edu.au> -  July2000
++ * Support for kiobuf-based I/O requests: Chaitanya Tumuluri [chait@sgi.com]
+  */
+ 
+ /*
+@@ -404,7 +405,9 @@
+ 	spin_lock_init(&q->queue_lock);
+ }
+ 
+-static int __make_request(request_queue_t * q, int rw, struct buffer_head * bh);
++static int __make_request(request_queue_t * q, int rw, struct buffer_head * bh,
++			  struct kiobuf * kiobuf, kdev_t dev, unsigned int sector,
++			  unsigned int count);
+ 
+ /**
+  * blk_init_queue  - prepare a request queue for use with a block device
+@@ -565,6 +568,121 @@
+ 		printk(KERN_ERR "drive_stat_acct: cmd not R/W?\n");
+ }
+ 
++/* Return up to two hd_structs on which to do IO accounting for a given
++ * request.  On a partitioned device, we want to account both against
++ * the partition and against the whole disk.  */
++static void locate_hd_struct(struct request *req, 
++			     struct hd_struct **hd1,
++			     struct hd_struct **hd2)
++{
++	struct gendisk *gd;
++
++	*hd1 = NULL;
++	*hd2 = NULL;
++	
++	gd = major_gendisk[MAJOR(req->rq_dev)];
++	if (gd && gd->part) {
++		/* Mask out the partition bits: account for the entire disk */
++		int devnr = MINOR(req->rq_dev) >> gd->minor_shift;
++		int whole_minor = devnr << gd->minor_shift;
++		*hd1 = &gd->part[whole_minor];
++		if (whole_minor != MINOR(req->rq_dev))
++			*hd2= &gd->part[MINOR(req->rq_dev)];
++	}
++}
++
++/* Round off the performance stats on an hd_struct.  The average IO
++ * queue length and utilisation statistics are maintained by observing
++ * the current state of the queue length and the amount of time it has
++ * been in this state for.  Normally, that accounting is done on IO
++ * completion, but that can result in more than a second's worth of IO
++ * being accounted for within any one second, leading to >100%
++ * utilisation.  To deal with that, we do a round-off before returning
++ * the results when reading /proc/partitions, accounting immediately for
++ * all queue usage up to the current jiffies and restarting the counters
++ * again. */
++void disk_round_stats(struct hd_struct *hd)
++{
++	unsigned long now = jiffies;
++	
++	hd->aveq += (hd->ios_in_flight * (jiffies - hd->last_queue_change));
++	hd->last_queue_change = now;
++
++	if (hd->ios_in_flight)
++		hd->io_ticks += (now - hd->last_idle_time);
++	hd->last_idle_time = now;	
++}
++
++
++static inline void down_ios(struct hd_struct *hd)
++{
++	disk_round_stats(hd);	
++	--hd->ios_in_flight;
++}
++
++static inline void up_ios(struct hd_struct *hd)
++{
++	disk_round_stats(hd);
++	++hd->ios_in_flight;
++}
++
++static void account_io_start(struct hd_struct *hd, struct request *req,
++			     int merge, int sectors)
++{
++	switch (req->cmd) {
++	case READ:
++		if (merge)
++			hd->rd_merges++;
++		hd->rd_sectors += sectors;
++		break;
++	case WRITE:
++		if (merge)
++			hd->wr_merges++;
++		hd->wr_sectors += sectors;
++		break;
++	default:
++	}
++	if (!merge)
++		up_ios(hd);
++}
++
++static void account_io_end(struct hd_struct *hd, struct request *req)
++{
++	unsigned long duration = jiffies - req->start_time;
++	switch (req->cmd) {
++	case READ:
++		hd->rd_ticks += duration;
++		hd->rd_ios++;
++		break;
++	case WRITE:
++		hd->wr_ticks += duration;
++		hd->wr_ios++;
++		break;
++	default:
++	}
++	down_ios(hd);
++}
++
++void req_new_io(struct request *req, int merge, int sectors)
++{
++	struct hd_struct *hd1, *hd2;
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		account_io_start(hd1, req, merge, sectors);
++	if (hd2)
++		account_io_start(hd2, req, merge, sectors);
++}
++
++void req_finished_io(struct request *req)
++{
++	struct hd_struct *hd1, *hd2;
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		account_io_end(hd1, req);
++	if (hd2)	
++		account_io_end(hd2, req);
++}
++
+ /*
+  * add-request adds a request to the linked list.
+  * io_request_lock is held and interrupts disabled, as we muck with the
+@@ -644,8 +762,11 @@
+ 			  int max_segments)
+ {
+ 	struct request *next;
++	struct hd_struct *hd1, *hd2;
+   
+ 	next = blkdev_next_request(req);
++        if (req->kiobuf || next->kiobuf)
++                return;
+ 	if (req->sector + req->nr_sectors != next->sector)
+ 		return;
+ 	if (req->cmd != next->cmd
+@@ -667,6 +788,15 @@
+ 	req->bhtail = next->bhtail;
+ 	req->nr_sectors = req->hard_nr_sectors += next->hard_nr_sectors;
+ 	list_del(&next->queue);
++
++	/* One last thing: we have removed a request, so we now have one
++	   less expected IO to complete for accounting purposes. */
++
++	locate_hd_struct(req, &hd1, &hd2);
++	if (hd1)
++		down_ios(hd1);
++	if (hd2)	
++		down_ios(hd2);
+ 	blkdev_release_request(next);
+ }
+ 
+@@ -694,10 +824,68 @@
+ 	attempt_merge(q, blkdev_entry_to_request(prev), max_sectors, max_segments);
+ }
+ 
+-static int __make_request(request_queue_t * q, int rw,
+-				  struct buffer_head * bh)
++ 
++static inline void __blk_init_req_bh(struct request *rq, struct buffer_head *bh)
++{		
++        rq->buffer = bh->b_data;
++        rq->kiobuf = NULL; 
++        rq->bh = bh;
++        rq->bhtail = bh;
++}
++ 
++static inline void __blk_init_req_kio(struct request *rq, struct kiobuf *kiobuf)
++{
++        unsigned int nr_bytes, total_bytes;
++        int kioind = 0, c_off;
++ 
++        /* Calculate req->buffer for kiobufs */
++        c_off = kiobuf->offset;
++        if (c_off > PAGE_SIZE) {
++                kioind = c_off >> PAGE_SHIFT;
++                c_off &= ~PAGE_MASK;
++        }
++ 
++        rq->buffer = c_off + (char *) page_address(kiobuf->maplist[kioind]);
++ 
++        /* Re-calculate current_nr_sectors */
++        nr_bytes = total_bytes = kiobuf->length;
++        if (!(PAGE_SIZE - c_off > total_bytes))
++                nr_bytes = PAGE_SIZE - c_off;
++ 
++        rq->hard_cur_sectors = rq->current_nr_sectors = nr_bytes >> 9; 
++ 
++        /* Recalculate # segments; reuse "kioind" from above */
++        for (; kioind < kiobuf->nr_pages && nr_bytes != total_bytes; kioind++){
++                ++rq->nr_segments;
++                if (nr_bytes + PAGE_SIZE > total_bytes)
++                        break;
++ 
++                nr_bytes += PAGE_SIZE;
++        }
++ 
++        rq->kiobuf = kiobuf; 
++        rq->bh = rq->bhtail = NULL;
++}
++ 
++ 
++static void blk_init_req(struct request *rq, struct buffer_head *bh,
++                         struct kiobuf *kiobuf)
++{
++        if (bh)
++                __blk_init_req_bh(rq, bh);
++        else if (kiobuf)
++                __blk_init_req_kio(rq, kiobuf);
++        else {
++                printk("blk_init_req: neither bh nor kio given\n");
++                BUG();
++        }
++}
++ 
++ 
++static int __make_request(request_queue_t * q, int rw, struct buffer_head * bh,
++			  struct kiobuf * kiobuf, kdev_t dev,
++			  unsigned int sector, unsigned int count)
+ {
+-	unsigned int sector, count;
+ 	int max_segments = MAX_SEGMENTS;
+ 	struct request * req, *freereq = NULL;
+ 	int rw_ahead, max_sectors, el_ret;
+@@ -705,9 +893,6 @@
+ 	int latency;
+ 	elevator_t *elevator = &q->elevator;
+ 
+-	count = bh->b_size >> 9;
+-	sector = bh->b_rsector;
+-
+ 	rw_ahead = 0;	/* normal case; gets changed below for READA */
+ 	switch (rw) {
+ 		case READA:
+@@ -722,6 +907,7 @@
+ 			goto end_io;
+ 	}
+ 
++	if(bh){
+ 	/* We'd better have a real physical mapping!
+ 	   Check this bit only if the buffer was dirty and just locked
+ 	   down by us so at this point flushpage will block and
+@@ -737,12 +923,13 @@
+ #if CONFIG_HIGHMEM
+ 	bh = create_bounce(rw, bh);
+ #endif
+-
++	}
+ /* look for a free request. */
+ 	/*
+ 	 * Try to coalesce the new request with old requests
+ 	 */
+-	max_sectors = get_max_sectors(bh->b_rdev);
++	max_sectors = get_max_sectors(dev);
++
+ 
+ again:
+ 	req = NULL;
+@@ -755,11 +942,14 @@
+ 
+ 	insert_here = head->prev;
+ 	if (list_empty(head)) {
+-		q->plug_device_fn(q, bh->b_rdev); /* is atomic */
++		q->plug_device_fn(q, dev); /* is atomic */
+ 		goto get_rq;
+ 	} else if (q->head_active && !q->plugged)
+ 		head = head->next;
+ 
++	if (kiobuf)
++                goto get_rq;
++
+ 	el_ret = elevator->elevator_merge_fn(q, &req, head, bh, rw,max_sectors);
+ 	switch (el_ret) {
+ 
+@@ -772,6 +962,7 @@
+ 			req->nr_sectors = req->hard_nr_sectors += count;
+ 			blk_started_io(count);
+ 			drive_stat_acct(req->rq_dev, req->cmd, count, 0);
++			req_new_io(req, 1, count);
+ 			attempt_back_merge(q, req, max_sectors, max_segments);
+ 			goto out;
+ 
+@@ -783,10 +974,12 @@
+ 			req->bh = bh;
+ 			req->buffer = bh->b_data;
+ 			req->current_nr_sectors = count;
++			req->hard_cur_sectors = count;
+ 			req->sector = req->hard_sector = sector;
+ 			req->nr_sectors = req->hard_nr_sectors += count;
+ 			blk_started_io(count);
+ 			drive_stat_acct(req->rq_dev, req->cmd, count, 0);
++			req_new_io(req, 1, count);
+ 			attempt_front_merge(q, head, req, max_sectors, max_segments);
+ 			goto out;
+ 
+@@ -819,9 +1012,11 @@
+ 		freereq = NULL;
+ 	} else if ((req = get_request(q, rw)) == NULL) {
+ 		spin_unlock_irq(&io_request_lock);
+-		if (rw_ahead)
++		if (rw_ahead) {
++			if (kiobuf)
++				kiobuf->errno = -EBUSY;
+ 			goto end_io;
+-
++		}
+ 		freereq = __get_request_wait(q, rw);
+ 		goto again;
+ 	}
+@@ -832,14 +1027,14 @@
+ 	req->errors = 0;
+ 	req->hard_sector = req->sector = sector;
+ 	req->hard_nr_sectors = req->nr_sectors = count;
+-	req->current_nr_sectors = count;
++	req->hard_cur_sectors = req->current_nr_sectors = count;
+ 	req->nr_segments = 1; /* Always 1 for a new request. */
+ 	req->nr_hw_segments = 1; /* Always 1 for a new request. */
+-	req->buffer = bh->b_data;
++	blk_init_req(req, bh, kiobuf);
+ 	req->sem = NULL;
+-	req->bh = bh;
+-	req->bhtail = bh;
+-	req->rq_dev = bh->b_rdev;
++	req->rq_dev = dev;
++	req->start_time = jiffies;
++	req_new_io(req, 0, count);
+ 	blk_started_io(count);
+ 	add_request(q, req, insert_here);
+ out:
+@@ -848,7 +1043,8 @@
+ 	spin_unlock_irq(&io_request_lock);
+ 	return 0;
+ end_io:
+-	bh->b_end_io(bh, test_bit(BH_Uptodate, &bh->b_state));
++	if (bh)
++		bh->b_end_io(bh, test_bit(BH_Uptodate, &bh->b_state));
+ 	return 0;
+ }
+ 
+@@ -886,22 +1082,35 @@
+  * particular, no other flags, are changed by generic_make_request or
+  * any lower level drivers.
+  * */
+-void generic_make_request (int rw, struct buffer_head * bh)
+-{
+-	int major = MAJOR(bh->b_rdev);
++void generic_make_request (int rw, struct buffer_head * bh,
++			   struct kiobuf * kiobuf, kdev_t dev,
++			   unsigned long blocknr, size_t blksize)
++{
++	int major, minor;
++	unsigned long sector;
++	unsigned int count;
+ 	request_queue_t *q;
+-
+-	if (!bh->b_end_io)
+-		BUG();
++	
++	if (bh) {
++		if (!bh->b_end_io)
++			BUG();
++                count = bh->b_size >> 9;
++                sector = bh->b_rsector;
++		dev = bh->b_rdev;
++	} else {
++		count = kiobuf->length >> 9;
++		sector = blocknr * (blksize >> 9);
++	}
++	major = MAJOR(dev);
++	minor = MINOR(dev);
+ 
+ 	if (blk_size[major]) {
+-		unsigned long maxsector = (blk_size[major][MINOR(bh->b_rdev)] << 1) + 1;
+-		unsigned long sector = bh->b_rsector;
+-		unsigned int count = bh->b_size >> 9;
++		unsigned long maxsector = (blk_size[major][minor] << 1) + 1;
+ 
+ 		if (maxsector < count || maxsector - count < sector) {
+-			bh->b_state &= (1 << BH_Lock) | (1 << BH_Mapped);
+-			if (blk_size[major][MINOR(bh->b_rdev)]) {
++			if (bh)
++				bh->b_state &= (1 << BH_Lock) | (1 << BH_Mapped);
++			if (blk_size[major][minor]) {
+ 				
+ 				/* This may well happen - the kernel calls bread()
+ 				   without checking the size of the device, e.g.,
+@@ -909,11 +1118,14 @@
+ 				printk(KERN_INFO
+ 				       "attempt to access beyond end of device\n");
+ 				printk(KERN_INFO "%s: rw=%d, want=%ld, limit=%d\n",
+-				       kdevname(bh->b_rdev), rw,
++				       kdevname(dev), rw,
+ 				       (sector + count)>>1,
+-				       blk_size[major][MINOR(bh->b_rdev)]);
++				       blk_size[major][minor]);
+ 			}
+-			bh->b_end_io(bh, 0);
++			if (bh)
++				bh->b_end_io(bh, 0);
++			else
++				kiobuf->errno = -EINVAL;
+ 			return;
+ 		}
+ 	}
+@@ -927,15 +1139,24 @@
+ 	 * Stacking drivers are expected to know what they are doing.
+ 	 */
+ 	do {
+-		q = blk_get_queue(bh->b_rdev);
++		/* LVM and others may have changed the dev for bh cases */
++		if (bh && dev != bh->b_rdev) {
++			dev = bh->b_rdev;
++			sector = bh->b_rsector;
++		}
++		
++		q = blk_get_queue(dev);
+ 		if (!q) {
+ 			printk(KERN_ERR
+ 			       "generic_make_request: Trying to access nonexistent block-device %s (%ld)\n",
+-			       kdevname(bh->b_rdev), bh->b_rsector);
+-			buffer_IO_error(bh);
++			       kdevname(dev), sector);
++			if (bh)
++				buffer_IO_error(bh);
++			else
++				kiobuf->errno = -ENODEV;
+ 			break;
+ 		}
+-	} while (q->make_request_fn(q, rw, bh));
++	} while (q->make_request_fn(q, rw, bh, kiobuf, dev, sector, count));
+ }
+ 
+ 
+@@ -968,7 +1189,7 @@
+ 	bh->b_rdev = bh->b_dev;
+ 	bh->b_rsector = bh->b_blocknr * count;
+ 
+-	generic_make_request(rw, bh);
++	generic_make_request(rw, bh, NULL, 0, 0, 0);
+ 
+ 	switch (rw) {
+ 		case WRITE:
+@@ -1110,6 +1331,98 @@
+ 		mark_buffer_clean(bhs[i]);
+ }
+ 
++
++
++/*
++ * Function:    ll_rw_kio()
++ *
++ * Purpose:     Insert kiobuf-based request into request queue.
++ *
++ * Arguments:   rw      - read/write
++ *              kiobuf  - collection of pages
++ *		dev	- device against which I/O requested
++ *		blocknr - dev block number at which to start I/O
++ *              sector  - units (512B or other) of blocknr
++ *              error   - return status
++ *
++ * Lock status: Assumed no lock held upon entry.
++ *		Assumed that the pages in the kiobuf ___ARE LOCKED DOWN___.
++ *
++ * Returns:     Nothing
++ *
++ * Notes:       This function is called from any subsystem using kiovec[]
++ *		collection of kiobufs for I/O (e.g. `pagebufs', raw-io). 
++ *		Relies on "kiobuf" field in the request structure.
++ */	
++void ll_rw_kio(int rw, struct kiobuf *kiobuf, kdev_t dev, unsigned long blocknr,
++	       size_t sector, int *error)
++{
++	int correct_size, i;
++
++	/*
++	 * Only support SCSI disk for now.
++	 *
++	 * ENOSYS to indicate caller
++	 * should try ll_rw_block()
++	 * for non-SCSI (e.g. IDE) disks.
++	 */
++	if (!SCSI_DISK_MAJOR(MAJOR(dev)) && !IDE_DISK_MAJOR(MAJOR(dev))) {
++		*error = -ENOSYS;
++		goto end_io;
++	}
++	/*
++	 * Sanity checks
++	 */
++	correct_size = BLOCK_SIZE;
++	if (blksize_size[MAJOR(dev)]) {
++		if ((i = blksize_size[MAJOR(dev)][MINOR(dev)]))
++			correct_size = i;
++	}
++	if (kiobuf->length % correct_size) {
++		printk(KERN_NOTICE "ll_rw_kio: "
++		       "request size [%d] not a multiple of device [%s] block-size [%d]\n",
++		       kiobuf->length,
++		       kdevname(dev),
++		       correct_size);
++		*error = -EINVAL;
++                goto end_io;
++	}
++	if ((rw & WRITE) && is_read_only(dev)) {
++		printk(KERN_NOTICE "Can't write to read-only device %s\n",
++		       kdevname(dev));
++		*error = -EPERM;
++		goto end_io;
++	}
++
++	switch(rw) {
++	case WRITE:
++		kstat.pgpgout++;
++		break;
++
++	case READA:
++	case READ:
++		kstat.pgpgin++;
++		break;
++	default:
++		BUG();
++	}
++
++	generic_make_request(rw, NULL, kiobuf, dev, blocknr, sector);
++	if (kiobuf->errno != 0) {
++		*error = kiobuf->errno;
++		goto end_io;
++	}
++	
++	return;
++end_io:
++	/*
++	 * We come here only on an error so, just set
++	 * kiobuf->errno if it isn't already set and return.
++	 */
++	if(kiobuf->errno == 0)
++		kiobuf->errno = *error;
++}
++
+ #ifdef CONFIG_STRAM_SWAP
+ extern int stram_device_init (void);
+ #endif
+@@ -1157,6 +1470,7 @@
+ 			req->nr_sectors = req->hard_nr_sectors;
+ 
+ 			req->current_nr_sectors = bh->b_size >> 9;
++			req->hard_cur_sectors = bh->b_size >> 9;
+ 			if (req->nr_sectors < req->current_nr_sectors) {
+ 				req->nr_sectors = req->current_nr_sectors;
+ 				printk("end_request: buffer-list destroyed\n");
+@@ -1172,6 +1486,7 @@
+ {
+ 	if (req->sem != NULL)
+ 		up(req->sem);
++	req_finished_io(req);
+ 
+ 	blkdev_release_request(req);
+ }
+@@ -1340,6 +1655,7 @@
+ EXPORT_SYMBOL(io_request_lock);
+ EXPORT_SYMBOL(end_that_request_first);
+ EXPORT_SYMBOL(end_that_request_last);
++EXPORT_SYMBOL(req_finished_io);
+ EXPORT_SYMBOL(blk_init_queue);
+ EXPORT_SYMBOL(blk_get_queue);
+ EXPORT_SYMBOL(__blk_get_queue);
+@@ -1348,6 +1664,7 @@
+ EXPORT_SYMBOL(blk_queue_pluggable);
+ EXPORT_SYMBOL(blk_queue_make_request);
+ EXPORT_SYMBOL(generic_make_request);
++EXPORT_SYMBOL(ll_rw_kio);
+ EXPORT_SYMBOL(blkdev_release_request);
+ EXPORT_SYMBOL(generic_unplug_device);
+ EXPORT_SYMBOL(queued_sectors);
+
+===========================================================================
+Index: linux/drivers/block/loop.c
+===========================================================================
+
+--- linux/drivers/block/loop.c	Tue Apr  3 17:46:10 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/block/loop.c_1.29	Tue Apr  3 17:57:09 2001
+@@ -418,7 +418,9 @@
+ 	return bh;
+ }
+ 
+-static int loop_make_request(request_queue_t *q, int rw, struct buffer_head *rbh)
++static int loop_make_request(request_queue_t *q, int rw, struct buffer_head *rbh,
++			     struct kiobuf *kio, kdev_t dev, unsigned int block,
++			     unsigned int bsize)
+ {
+ 	struct buffer_head *bh = NULL;
+ 	struct loop_device *lo;
+@@ -473,7 +475,7 @@
+ 			goto err;
+ 	}
+ 
+-	generic_make_request(rw, bh);
++	generic_make_request(rw, bh, NULL, 0, 0, 0);
+ 	return 0;
+ 
+ err:
+
+===========================================================================
+Index: linux/drivers/block/rd.c
+===========================================================================
+
+--- linux/drivers/block/rd.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/block/rd.c_1.27	Tue Apr  3 17:57:09 2001
+@@ -194,7 +194,9 @@
+  * 19-JAN-1998  Richard Gooch <rgooch@atnf.csiro.au>  Added devfs support
+  *
+  */
+-static int rd_make_request(request_queue_t * q, int rw, struct buffer_head *sbh)
++static int rd_make_request(request_queue_t * q, int rw, struct buffer_head *sbh,
++			struct kiobuf *kio, kdev_t dev, unsigned int block,
++			unsigned int bsize)
+ {
+ 	unsigned int minor;
+ 	unsigned long offset, len;
+
+===========================================================================
+Index: linux/drivers/char/raw.c
+===========================================================================
+
+--- linux/drivers/char/raw.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/char/raw.c_1.13	Tue Apr  3 17:57:09 2001
+@@ -240,6 +240,76 @@
+ #define SECTOR_SIZE (1U << SECTOR_BITS)
+ #define SECTOR_MASK (SECTOR_SIZE - 1)
+ 
++/*
++ * IO completion routine for a kiobuf-based request.
++ */
++static void end_kiobuf_io_kiobuf(struct kiobuf *kiobuf)
++{
++	kiobuf->locked = 0;
++	if (atomic_dec_and_test(&kiobuf->io_count))
++		wake_up(&kiobuf->wait_queue);
++}
++
++/*
++ * Send I/O down the ll_rw_kio() path first.
++ * It is assumed that any requisite locking
++ * and unlocking of pages in the kiobuf has
++ * been taken care of by the caller.
++ *
++ * Return 0 if I/O should be retried on buffer_head path.
++ * Return number of transferred bytes if successful.
++ * Return -1 value, if there was an I/O error.
++ */
++static inline int try_kiobuf_io(struct kiobuf *iobuf,
++				int rw,
++				unsigned long blocknr,
++				kdev_t dev,
++				char *buf,
++				size_t sector_size)
++{	
++	int err, retval;
++
++        /* Bounce ... ugh! */
++        err = setup_kiobuf_bounce_pages(iobuf, GFP_USER);
++        if (err) {
++		retval = 0;
++                goto error;
++	}
++        if (rw & WRITE)
++                kiobuf_copy_bounce(iobuf, COPY_TO_BOUNCE, -1);
++
++        /* Now do actual I/O */
++	iobuf->end_io = end_kiobuf_io_kiobuf;
++	iobuf->errno = 0;
++	iobuf->locked = 1;
++	atomic_inc(&iobuf->io_count);
++	err = 0;
++	ll_rw_kio(rw, iobuf, dev, blocknr, sector_size, &err);
++
++	if ( err == 0 ) {
++		kiobuf_wait_for_io(iobuf);
++		if (iobuf->errno == 0) {
++			retval = iobuf->length; /* Success */
++		} else {
++			retval = -1;	        /* I/O error */
++		}
++	} else { 
++		atomic_dec(&iobuf->io_count);
++		if ( err == -ENOSYS ) {
++			retval = 0;             /* Retry the buffer_head path */
++		} else {
++			retval = -1;            /* I/O error */
++		}
++	}
++
++ error:	
++        /* Take care of any bounce buffers allocated */
++        cleanup_bounce_buffers(rw, 1, &iobuf, retval);
++	iobuf->locked = 0;
++	return retval;       
++}
++
++
+ ssize_t	rw_raw_dev(int rw, struct file *filp, char *buf, 
+ 		   size_t size, loff_t *offp)
+ {
+@@ -256,7 +326,8 @@
+ 
+ 	int		sector_size, sector_bits, sector_mask;
+ 	int		max_sectors;
+-	
++	int 		kiobuf_io = 1;
++
+ 	/*
+ 	 * First, a few checks on device size limits 
+ 	 */
+@@ -288,17 +359,17 @@
+ 	if (err)
+ 		return err;
+ 
++	blocknr = *offp >> sector_bits;
+ 	/*
+-	 * Split the IO into KIO_MAX_SECTORS chunks, mapping and
+-	 * unmapping the single kiobuf as we go to perform each chunk of
+-	 * IO.  
++	 * Try sending down the entire kiobuf first via ll_rw_kio().
++	 * If not successful then, split the IO into KIO_MAX_SECTORS
++	 * chunks, mapping and unmapping the single kiobuf as we go
++	 * to perform each chunk of IO.  
+ 	 */
+-
+-	transferred = 0;
+-	blocknr = *offp >> sector_bits;
++	err = transferred = 0;
+ 	while (size > 0) {
+ 		blocks = size >> sector_bits;
+-		if (blocks > max_sectors)
++		if (blocks > max_sectors && (kiobuf_io == 0))
+ 			blocks = max_sectors;
+ 		if (blocks > limit - blocknr)
+ 			blocks = limit - blocknr;
+@@ -315,11 +386,20 @@
+ 		if (err) 
+ 			break;
+ #endif
+-	
+-		for (i=0; i < blocks; i++) 
+-			b[i] = blocknr++;
++		if (kiobuf_io == 0) {
++                        for (i=0; i < blocks; i++) 
++                                b[i] = blocknr++;
+ 		
+-		err = brw_kiovec(rw, 1, &iobuf, dev, b, sector_size);
++                        err = brw_kiovec(rw, 1, &iobuf, dev, b, sector_size);
++		} else {
++			err = try_kiobuf_io(iobuf, rw, blocknr, dev, buf, sector_size);
++			if ( err > 0 ) { 
++				blocknr += (err >> sector_bits);
++			} else if ( err == 0 ) {
++				kiobuf_io = 0;
++				continue;
++			} /* else if err < 0, break out of loop below */
++		}
+ 
+ 		if (err >= 0) {
+ 			transferred += err;
+
+===========================================================================
+Index: linux/drivers/ide/ide-disk.c
+===========================================================================
+
+--- linux/drivers/ide/ide-disk.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/ide/ide-disk.c_1.12	Tue Apr  3 17:57:09 2001
+@@ -220,6 +220,88 @@
+ }
+ 
+ /*
++ * Function:    __ide_update_bh_request()
++ *
++ * Purpose:     Helper routine for ide_multwrite() to update the rq->buffer
++ *		pointer and rq->X_Y_sectors, if not at the end of I/O.
++ *
++ * Arguments:   rq       - request struct. 
++ *              mcount   - max. size of PRD table for I/O.
++ *
++ * Lock status: Assumed that io_requset_lock is held upon entry.
++ *
++ * Returns:     Nothing
++ *
++ * Notes:	Separate buffer-head processing from kiobuf processing
++ *		We're operating on the hwgroup->wrq.
++ */
++inline void __ide_update_bh_request(struct request *rq, unsigned int *mcount)
++{
++        struct buffer_head *bh = rq->bh->b_reqnext;
++        
++        /* end early early we ran out of requests */
++        if (!bh) {
++                *mcount = 0;
++        } else {
++                rq->bh = bh;
++                rq->current_nr_sectors = bh->b_size >> 9;
++                rq->buffer             = bh->b_data;
++        }
++}
++
++/*
++ * Function:    __ide_update_kio_request()
++ *
++ * Purpose:     Helper routine for ide_multwrite() to update the rq->buffer
++ *		pointer and rq->X_Y_sectors, if not at the end of I/O.
++ *
++ * Arguments:   req      - request struct. 
++ *              mcount   - max. size of PRD table for I/O
++ *
++ * Lock status: Assumed that io_requset_lock is held upon entry.
++ *
++ * Returns:     Nothing
++ *
++ * Notes:	Separate buffer-head processing from kiobuf processing
++ *		We're operating on the hwgroup->wrq.
++ */
++inline void __ide_update_kio_request(struct request *rq, int c_off, unsigned int *mcount)
++{
++	int index = 0;
++	unsigned int nr_bytes;
++
++	/* How far into the kiobuf is the offset? */
++	if (c_off > PAGE_CACHE_SIZE) {
++		index = c_off >> PAGE_CACHE_SHIFT;
++		c_off &= ~PAGE_CACHE_MASK;
++	}
++
++        /* Finished all sectors? */
++        if (rq->nr_sectors == 0) {
++                *mcount = 0; 
++        } else {
++		/* Sanity check: c_off should be page-aligned */
++		if (c_off & ~PAGE_CACHE_MASK) {
++			printk("Offset calculations busted in ide_multwrite()!\n");
++			BUG();
++		}
++		if (index >= rq->kiobuf->nr_pages) {
++			printk("Index fell off end of kiobuf\n");
++			BUG();
++		}
++		nr_bytes = rq->nr_sectors << 9;
++                /* Update rq->current_nr_sectors based on nr_bytes value */
++                if (PAGE_CACHE_SIZE > nr_bytes)
++                        rq->current_nr_sectors = nr_bytes >> 9;
++                else 
++                        rq->current_nr_sectors = PAGE_CACHE_SIZE >> 9;
++                
++                /* Update rq->buffer */
++                rq->buffer = page_address(rq->kiobuf->maplist[index]);
++        }
++}
++
++/*
+  * ide_multwrite() transfers a block of up to mcount sectors of data
+  * to a drive as part of a disk multiple-sector write operation.
+  *
+@@ -234,35 +316,50 @@
+ {
+  	ide_hwgroup_t	*hwgroup= HWGROUP(drive);
+  	struct request	*rq = &hwgroup->wrq;
++	unsigned long flags;
+  
+   	do {
+-  		char *buffer;
+   		int nsect = rq->current_nr_sectors;
++  		char *buffer;
+  
+ 		if (nsect > mcount)
+ 			nsect = mcount;
+ 		mcount -= nsect;
+ 		buffer = rq->buffer;
+ 
++                /*
++                 * Careful: ide_multwrite() Can be called from both non-irq 
++                 *   and irq context. Grab (i.e. abuse!) the io_request_lock.
++                 */
++                spin_lock_irqsave(&io_request_lock, flags);
++
+ 		rq->sector += nsect;
+ 		rq->buffer += nsect << 9;
+ 		rq->nr_sectors -= nsect;
+ 		rq->current_nr_sectors -= nsect;
++		rq->hard_nr_sectors -= nsect; /* Necessary to track completion! */
+ 
+-		/* Do we move to the next bh after this? */
+-		if (!rq->current_nr_sectors) {
+-			struct buffer_head *bh = rq->bh->b_reqnext;
++		if (rq->kiobuf) {
++			hwgroup->kio_offset += nsect << 9;
++		}
+ 
+-			/* end early early we ran out of requests */
+-			if (!bh) {
+-				mcount = 0;
+-			} else {
+-				rq->bh = bh;
+-				rq->current_nr_sectors = bh->b_size >> 9;
+-				rq->buffer             = bh->b_data;
+-			}
++		/*
++                 * Do we need to update rq->buffer after this?
++                 * Note: ide_multwrite/multwrite_intr operate on
++                 *	the hwgroup->wrq; whereas the end_request()
++                 *	operate on the original hwgroup->rq.
++                 */
++		if (!rq->current_nr_sectors) {
++                        if (rq->kiobuf) {
++                                __ide_update_kio_request(rq,
++						hwgroup->kio_offset, &mcount);
++                        } else {
++                                __ide_update_bh_request(rq, &mcount);
++                        }
+ 		}
+ 
++                spin_unlock_irqrestore(&io_request_lock, flags);
++
+ 		/*
+ 		 * Ok, we're all setup for the interrupt
+ 		 * re-entering us on the last transfer.
+@@ -306,6 +403,9 @@
+ 					i -= rq->current_nr_sectors;
+ 					ide_end_request(1, hwgroup);
+ 				}
++				if (rq->kiobuf)
++					hwgroup->kio_offset = 0;
++
+ 				return ide_stopped;
+ 			}
+ 		}
+@@ -369,7 +469,13 @@
+ {
+ 	if (IDE_CONTROL_REG)
+ 		OUT_BYTE(drive->ctl,IDE_CONTROL_REG);
+-	OUT_BYTE(rq->nr_sectors,IDE_NSECTOR_REG);
++
++	/*
++	 * for clustered kio requests, nr_sectors can be much bigger than
++	 * what ide hw can handle. do those in chunks of 256
++	 */
++	OUT_BYTE(rq->nr_sectors < 256 ? rq->nr_sectors : 0, IDE_NSECTOR_REG);
++
+ #ifdef CONFIG_BLK_DEV_PDC4030
+ 	if (drive->select.b.lba || IS_PDC4030_DRIVE) {
+ #else /* !CONFIG_BLK_DEV_PDC4030 */
+@@ -440,7 +546,33 @@
+ 			 *
+ 			 * Except when you get an error it seems...
+ 			 */
++
++			/*
++			 * I/O is done in chunks of 256 sectors. The
++			 * "scratchpad" (including rq->nr_sectors) is
++			 * copied over for every ide_multwrite() call,
++			 * below. So, we need to preserve the current
++			 * value of wrq->nr_sectors before it is written
++			 * over. This is necessary for termination condition
++			 * in multwrite_intr().
++			 *
++			 * This is only an issue for kiobuf requests which
++			 * are larger than the 256 sectors PRD limit.
++			 *
++			 * YUCK!
++			 */
++			unsigned long nr_sectors = 0;
++			/* If a kiobuf request and is a re-injection */
++			if (rq->kiobuf && (rq->kiobuf->offset < hwgroup->kio_offset))
++				nr_sectors = rq->nr_sectors - hwgroup->wrq.nr_sectors;
++
+ 			hwgroup->wrq = *rq; /* scratchpad */
++			hwgroup->wrq.nr_sectors -= nr_sectors;
++
++			/* If a kiobuf request and is an original injection */
++			if (rq->kiobuf && hwgroup->kio_offset == 0)
++				hwgroup->kio_offset = rq->kiobuf->offset;
++
+ 			ide_set_handler (drive, &multwrite_intr, WAIT_CMD, NULL);
+ 			if (ide_multwrite(drive, drive->mult_count)) {
+ 				unsigned long flags;
+
+===========================================================================
+Index: linux/drivers/ide/ide-dma.c
+===========================================================================
+
+--- linux/drivers/ide/ide-dma.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/ide/ide-dma.c_1.9	Tue Apr  3 17:57:09 2001
+@@ -199,9 +199,10 @@
+ 	if (OK_STAT(stat,DRIVE_READY,drive->bad_wstat|DRQ_STAT)) {
+ 		if (!dma_stat) {
+ 			struct request *rq = HWGROUP(drive)->rq;
+-			rq = HWGROUP(drive)->rq;
+-			for (i = rq->nr_sectors; i > 0;) {
+-				i -= rq->current_nr_sectors;
++			if ((i = rq->nr_sectors) > 256)
++				i = 256;
++			while (i > 0) {
++				i -= rq->hard_cur_sectors;
+ 				ide_end_request(1, HWGROUP(drive));
+ 			}
+ 			return ide_stopped;
+@@ -211,16 +212,81 @@
+ 	return ide_error(drive, "dma_intr", stat);
+ }
+ 
+-static int ide_build_sglist (ide_hwif_t *hwif, struct request *rq)
++/*
++ * Build kiobuf based scatter-gather list. Return number of segments.
++ */
++static int ide_kio_sgl(struct request *rq, struct scatterlist *sg)
++{
++	unsigned int total_bytes, nr_bytes, nr_seg, sg_size, segs;
++	struct kiobuf *kiobuf = rq->kiobuf;
++	unsigned int c_off, nr_pgs = 0, nr_sects = 0;
++	unsigned char *va;
++
++	/*
++	 * For leftover requests, only rq->nr_sectors gets adjusted.
++	 */
++	total_bytes = rq->nr_sectors << 9;
++
++	/*
++	 * find offset
++	 */
++	c_off = kiobuf->offset + (((kiobuf->length >> 9) - rq->nr_sectors) << 9);
++	if (c_off >= PAGE_SIZE) {
++		nr_pgs = (c_off >> PAGE_SHIFT);
++		c_off &= ~PAGE_MASK;
++	}
++
++	/*
++	 * limit to max ide hw size, if need be
++	 */
++	if ((segs = rq->nr_segments) > PRD_ENTRIES)
++		segs = PRD_ENTRIES;
++
++	/*
++	 * now build sg list
++	 */
++	for (sg_size = 0, nr_seg = 0, nr_bytes = 0; nr_seg < segs && nr_sects <= 256; nr_seg++, nr_sects += sg_size >> 9) {
++		va = c_off + (char *) page_address(kiobuf->maplist[nr_pgs]);
++		nr_pgs++;
++		if (c_off) {
++			if ((sg_size = PAGE_SIZE - c_off) > total_bytes)
++				sg_size = total_bytes;
++
++			c_off = 0;
++		} else if (nr_bytes + PAGE_SIZE > total_bytes) {
++			sg_size = total_bytes - nr_bytes;
++		} else {
++			sg_size = PAGE_SIZE;
++		}
++
++		nr_bytes += sg_size;
++		memset(&sg[nr_seg], 0, sizeof(struct scatterlist));
++		sg[nr_seg].address = va;
++		sg[nr_seg].length = sg_size;
++	}
++
++	/*
++	 * your plain paranoia
++	 */
++	if ((nr_bytes > total_bytes) || (nr_pgs > rq->kiobuf->nr_pages)) {
++		printk(KERN_ERR
++                       "ide_kio_sgl: sgl bytes[%d], request bytes[%d]\n"
++                       "ide_kio_sgl: pgcnt[%d], kiobuf->pgcnt[%d]!\n",
++			nr_bytes, total_bytes, nr_pgs, kiobuf->nr_pages);
++		BUG();
++	}
++
++	return nr_seg;
++}
++
++/*
++ * Build bh based scatter-gather list. Return number of segments.
++ */
++static int ide_bh_sgl(struct request *rq, struct scatterlist *sg)
+ {
+ 	struct buffer_head *bh;
+-	struct scatterlist *sg = hwif->sg_table;
+ 	int nents = 0;
+ 
+-	if (rq->cmd == READ)
+-		hwif->sg_dma_direction = PCI_DMA_FROMDEVICE;
+-	else
+-		hwif->sg_dma_direction = PCI_DMA_TODEVICE;
+ 	bh = rq->bh;
+ 	do {
+ 		unsigned char *virt_addr = bh->b_data;
+@@ -234,12 +300,32 @@
+ 				break;
+ 			size += bh->b_size;
+ 		}
+-		memset(&sg[nents], 0, sizeof(*sg));
++		memset(&sg[nents], 0, sizeof(struct scatterlist));
+ 		sg[nents].address = virt_addr;
+ 		sg[nents].length = size;
+ 		nents++;
+ 	} while (bh != NULL);
+ 
++	return nents;
++}
++
++static int ide_build_sglist (ide_hwif_t *hwif, struct request *rq)
++{
++	struct scatterlist *sg = hwif->sg_table;
++	int nents;
++
++	if (rq->cmd == READ)
++		hwif->sg_dma_direction = PCI_DMA_FROMDEVICE;
++	else
++		hwif->sg_dma_direction = PCI_DMA_TODEVICE;
++
++	if (rq->bh)
++		nents = ide_bh_sgl(rq, sg);
++	else if (rq->kiobuf)
++		nents = ide_kio_sgl(rq, sg);
++	else
++		panic("neither rq->bh nor rq->kiobuf in place\n");
++
+ 	return pci_map_sg(hwif->pci_dev, sg, nents, hwif->sg_dma_direction);
+ }
+ 
+@@ -306,8 +392,11 @@
+ 		i--;
+ 	}
+ 
+-	if (!count)
++	if (!count) {
++		struct request *rq = HWGROUP(drive)->rq;
+ 		printk("%s: empty DMA table?\n", drive->name);
++		printk("sector %lu, hard sector %lu, nr_sectors %lu, hard nr_sectors %lu, cur nr_sectors %lu\n", rq->sector, rq->hard_sector, rq->nr_sectors, rq->hard_nr_sectors, rq->current_nr_sectors);
++	}
+ 	else if (!is_trm290_chipset)
+ 		*--table |= cpu_to_le32(0x80000000);
+ 
+
+===========================================================================
+Index: linux/drivers/ide/ide.c
+===========================================================================
+
+--- linux/drivers/ide/ide.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/ide/ide.c_1.19	Tue Apr  3 17:57:09 2001
+@@ -502,6 +502,92 @@
+ 	return 1;		/* drive ready: *might* be interrupting */
+ }
+ 
++int ide_end_kio_request(struct request *rq, int uptodate, int sectors)
++{
++	int pgcnt = 0, nr_pages;
++	size_t curr_offset;
++	unsigned int nr_bytes, total_bytes, page_sectors, nr_sectors;
++	char *va = NULL;
++
++	if ((nr_sectors = rq->hard_nr_sectors) > 256)
++		nr_sectors = 256;
++
++	blk_finished_io(sectors);
++
++	nr_pages = rq->kiobuf->nr_pages;
++	total_bytes = nr_sectors << 9;
++	curr_offset = rq->kiobuf->offset;
++
++	/*
++	 * In the case of leftover requests, the kiobuf->length
++	 * remains the same, but rq->nr_sectors would be smaller.
++	 * Adjust curr_offset in this case. If not a leftover,
++	 * the following makes no difference.
++	 */
++	curr_offset += (((rq->kiobuf->length >> 9) - nr_sectors) << 9);
++
++	/* How far into the kiobuf is the offset? */
++	if (curr_offset > PAGE_SIZE) {
++		pgcnt = curr_offset >> PAGE_SHIFT;
++		curr_offset &= ~PAGE_MASK;
++	}
++
++	/*		
++	 * Reusing the pgcnt and va value from above:
++	 * Harvest pages to account for number of sectors 
++	 * passed into function. 
++	 */
++	for (nr_bytes = 0; pgcnt < nr_pages && nr_bytes != total_bytes; pgcnt++) {
++		va = page_address(rq->kiobuf->maplist[pgcnt]) + curr_offset;
++		/* First page or final page? Partial page? */
++		if (curr_offset) {
++			if (PAGE_SIZE - curr_offset > total_bytes)
++				page_sectors = total_bytes >> 9;
++			else
++				page_sectors = (PAGE_SIZE - curr_offset) >> 9;
++			curr_offset = 0;
++		} else if (nr_bytes + PAGE_SIZE > total_bytes) {
++			page_sectors = (total_bytes - nr_bytes) >> 9;
++		} else {
++			page_sectors = PAGE_SIZE >> 9;
++		}
++		nr_bytes += (page_sectors << 9);
++		/* Leftover sectors in this page (onward)? */
++		if (sectors < page_sectors) {
++			rq->hard_nr_sectors -= sectors;
++			rq->sector += sectors;
++			rq->hard_cur_sectors = page_sectors - sectors;
++			va += (sectors << 9); /* Update for rq->buffer */
++			sectors = 0;
++			break;
++		}
++
++		/* Mark this page as done */
++		rq->nr_segments--;
++		rq->hard_nr_sectors -= page_sectors;
++		rq->sector += page_sectors;
++		if (!uptodate && rq->kiobuf->errno)
++			rq->kiobuf->errno = -EIO;
++		sectors -= page_sectors;
++	}
++
++	rq->current_nr_sectors = rq->hard_cur_sectors;
++	rq->nr_sectors = rq->hard_nr_sectors;
++
++	/* Check for leftovers */
++	if (rq->hard_nr_sectors) {
++		rq->buffer = va;
++		if (!rq->nr_segments)
++			rq->nr_segments = 1;
++		return 1;
++	}
++
++	if (rq->kiobuf->end_io)
++		rq->kiobuf->end_io(rq->kiobuf);
++
++	return 0;
++}
++
+ /*
+  * This is our end_request replacement function.
+  */
+@@ -509,11 +595,24 @@
+ {
+ 	struct request *rq;
+ 	unsigned long flags;
++	int r;
+ 
+ 	spin_lock_irqsave(&io_request_lock, flags);
+ 	rq = hwgroup->rq;
+ 
+-	if (!end_that_request_first(rq, uptodate, hwgroup->drive->name)) {
++	/*
++	 * kiovec request
++	 */
++	if (rq->kiobuf)
++		r = ide_end_kio_request(rq, uptodate, rq->hard_cur_sectors);
++	else
++		r = end_that_request_first(rq, uptodate, hwgroup->drive->name);
++
++	/*
++	 * finish request if either kiovec request or bh based request
++	 * is done
++	 */
++	if (!r) {
+ 		add_blkdev_randomness(MAJOR(rq->rq_dev));
+ 		blkdev_dequeue_request(rq);
+         	hwgroup->rq = NULL;
+
+===========================================================================
+Index: linux/drivers/md/raid1.c
+===========================================================================
+
+--- linux/drivers/md/raid1.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/md/raid1.c_1.6	Tue Apr  3 17:57:09 2001
+@@ -608,7 +608,7 @@
+ 	/*	bh_req->b_rsector = bh->n_rsector; */
+ 		bh_req->b_end_io = raid1_end_request;
+ 		bh_req->b_private = r1_bh;
+-		generic_make_request (rw, bh_req);
++		generic_make_request (rw, bh_req, NULL, 0, 0, 0);
+ 		return 0;
+ 	}
+ 
+@@ -683,7 +683,7 @@
+ 	while(bh) {
+ 		struct buffer_head *bh2 = bh;
+ 		bh = bh->b_next;
+-		generic_make_request(rw, bh2);
++		generic_make_request(rw, bh2, NULL, 0, 0, 0);
+ 	}
+ 	return (0);
+ }
+@@ -1179,7 +1179,7 @@
+ 				while (mbh) {
+ 					struct buffer_head *bh1 = mbh;
+ 					mbh = mbh->b_next;
+-					generic_make_request(WRITE, bh1);
++					generic_make_request(WRITE, bh1, NULL, 0, 0, 0);
+ 					md_sync_acct(bh1->b_dev, bh1->b_size/512);
+ 				}
+ 			} else {
+@@ -1192,7 +1192,7 @@
+ 					printk (REDIRECT_SECTOR,
+ 						partition_name(bh->b_dev), bh->b_blocknr);
+ 					bh->b_rdev = bh->b_dev;
+-					generic_make_request(READ, bh);
++					generic_make_request(READ, bh, NULL, 0, 0, 0);
+ 				}
+ 			}
+ 
+@@ -1209,7 +1209,7 @@
+ 				printk (REDIRECT_SECTOR,
+ 					partition_name(bh->b_dev), bh->b_blocknr);
+ 				bh->b_rdev = bh->b_dev;
+-				generic_make_request (r1_bh->cmd, bh);
++				generic_make_request (r1_bh->cmd, bh, NULL, 0, 0, 0);
+ 			}
+ 			break;
+ 		}
+@@ -1395,7 +1395,7 @@
+ 	bh->b_rsector = sector;
+ 	init_waitqueue_head(&bh->b_wait);
+ 
+-	generic_make_request(READ, bh);
++	generic_make_request(READ, bh, NULL, 0, 0, 0);
+ 	md_sync_acct(bh->b_dev, bh->b_size/512);
+ 
+ 	return (bsize >> 9);
+
+===========================================================================
+Index: linux/drivers/md/raid5.c
+===========================================================================
+
+--- linux/drivers/md/raid5.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/md/raid5.c_1.12	Tue Apr  3 17:57:09 2001
+@@ -1096,7 +1096,7 @@
+ 				atomic_inc(&sh->count);
+ 				bh->b_rdev = bh->b_dev;
+ 				bh->b_rsector = bh->b_blocknr * (bh->b_size>>9);
+-				generic_make_request(action[i]-1, bh);
++				generic_make_request(action[i]-1, bh, NULL, 0, 0, 0);
+ 			} else {
+ 				PRINTK("skip op %d on disc %d for sector %ld\n", action[i]-1, i, sh->sector);
+ 				clear_bit(BH_Lock, &bh->b_state);
+
+===========================================================================
+Index: linux/drivers/scsi/scsi_lib.c
+===========================================================================
+
+--- linux/drivers/scsi/scsi_lib.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/scsi/scsi_lib.c_1.28	Tue Apr  3 17:57:09 2001
+@@ -15,6 +15,8 @@
+  * a low-level driver if they wished.   Note however that this file also
+  * contains the "default" versions of these functions, as we don't want to
+  * go through and retrofit queueing functions into all 30 some-odd drivers.
++ *
++ * Added support for kiobuf-based I/O requests. [Chaitanya Tumuluri, chait@sgi.com]
+  */
+ 
+ #define __NO_VERSION__
+@@ -330,6 +332,155 @@
+ 	spin_unlock_irqrestore(&io_request_lock, flags);
+ }
+ 
++
++/*
++ * Function:    __scsi_collect_bh_sectors()
++ *
++ * Purpose:     Helper routine for __scsi_end_request() to mark some number
++ *		(or all, if that is the case) of sectors complete.
++ *
++ * Arguments:   req      - request struct. from scsi command block.
++ *              uptodate - 1 if I/O indicates success, 0 for I/O error.
++ *              sectors  - number of sectors we want to mark.
++ *		leftovers- indicates if any sectors were not done.
++ *
++ * Lock status: Assumed that lock is not held upon entry.
++ *
++ * Returns:     Nothing
++ *
++ * Notes:	Separate buffer-head processing from kiobuf processing
++ */
++__inline static void __scsi_collect_bh_sectors(struct request *req,
++					       int uptodate,
++					       int sectors,
++					       char **leftovers)
++{
++	struct buffer_head *bh;
++	int nsect;
++	
++	do {
++		if ((bh = req->bh) != NULL) {
++			nsect = bh->b_size >> 9;
++			blk_finished_io(nsect);
++			req->bh = bh->b_reqnext;
++			req->nr_sectors -= nsect;
++			req->sector += nsect;
++			bh->b_reqnext = NULL;
++			sectors -= nsect;
++			bh->b_end_io(bh, uptodate);
++			if ((bh = req->bh) != NULL) {
++				req->current_nr_sectors = bh->b_size >> 9;
++				if (req->nr_sectors < req->current_nr_sectors) {
++					req->nr_sectors = req->current_nr_sectors;
++					printk("scsi_end_request: buffer-list destroyed\n");
++				}
++			}
++		}
++	} while (sectors && bh);
++
++	/* Check for leftovers */
++	if (req->bh) {
++		*leftovers = req->bh->b_data;
++	}	
++}	
++
++/*
++ * Function:    __scsi_collect_kio_sectors()
++ *
++ * Purpose:     Helper routine for __scsi_end_request() to mark some number
++ *		(or all) of the I/O sectors and attendant pages complete.
++ *		Updates the request nr_segments, nr_sectors accordingly.
++ *
++ * Arguments:   req      - request struct. from scsi command block.
++ *              uptodate - 1 if I/O indicates success, 0 for I/O error.
++ *              sectors  - number of sectors we want to mark.
++ *		leftovers- indicates if any sectors were not done.
++ *
++ * Lock status: Assumed that lock is not held upon entry.
++ *
++ * Returns:     Nothing
++ *
++ * Notes:	Separate buffer-head processing from kiobuf processing.
++ *		We don't know if this was a single or multi-segment sgl
++ *		request. Treat it as though it were a multi-segment one.
++ */
++__inline static void __scsi_collect_kio_sectors(struct request *req,
++					      int uptodate,
++					      int sectors,
++					      char **leftovers)
++{
++	int pgcnt = 0, nr_pages;
++	size_t curr_offset;
++	unsigned long va = 0;
++	unsigned int nr_bytes, total_bytes, page_sectors;
++	
++	nr_pages = req->kiobuf->nr_pages;
++	total_bytes = (req->nr_sectors << 9);
++	curr_offset = req->kiobuf->offset;
++
++	blk_finished_io(sectors);
++
++	/*
++	 * In the case of leftover requests, the kiobuf->length
++	 * remains the same, but req->nr_sectors would be smaller.
++	 * Adjust curr_offset in this case. If not a leftover,
++	 * the following makes no difference.
++	 */
++	curr_offset += (((req->kiobuf->length >> 9) - req->nr_sectors) << 9);
++
++	/* How far into the kiobuf is the offset? */
++	if (curr_offset > PAGE_SIZE) {
++		pgcnt = (curr_offset >> PAGE_SHIFT);
++		curr_offset &= ~PAGE_MASK;
++	}
++
++	/*		
++	 * Reusing the pgcnt and va value from above:
++	 * Harvest pages to account for number of sectors 
++	 * passed into function. 
++	 */
++	for (nr_bytes = 0; pgcnt<nr_pages && nr_bytes != total_bytes; pgcnt++) {
++		va = (unsigned long) page_address(req->kiobuf->maplist[pgcnt]) + curr_offset;
++		/* First page or final page? Partial page? */
++		if (curr_offset != 0) {
++                        page_sectors = (PAGE_SIZE - curr_offset) > total_bytes ?
++                                total_bytes >> 9 : (PAGE_SIZE - curr_offset) >> 9;
++                        curr_offset = 0;
++		} else if((nr_bytes + PAGE_SIZE) > total_bytes) {
++			page_sectors = (total_bytes - nr_bytes) >> 9;
++		} else {	
++			page_sectors = PAGE_SIZE >> 9;
++		}
++		nr_bytes += (page_sectors << 9);
++		/* Leftover sectors in this page (onward)? */
++		if (sectors < page_sectors) {
++			req->nr_sectors -= sectors;
++			req->sector += sectors;
++			req->current_nr_sectors = page_sectors - sectors;
++			va += (sectors << 9); /* Update for req->buffer */
++			sectors = 0;
++			break;
++		} else {
++			/* Mark this page as done */
++			req->nr_segments--;   /* No clustering for kiobuf */ 
++			req->nr_sectors -= page_sectors;
++			req->sector += page_sectors;
++			if (!uptodate && (req->kiobuf->errno != 0)){
++				req->kiobuf->errno = -EIO;
++			}
++			sectors -= page_sectors;
++		}
++	}
++
++	/* Check for leftovers */
++	if (req->nr_sectors) {
++		*leftovers = (char *)va;
++	} else if (req->kiobuf->end_io) {
++		req->kiobuf->end_io(req->kiobuf);
++	}
++}	
++
++
+ /*
+  * Function:    scsi_end_request()
+  *
+@@ -360,10 +511,9 @@
+ 				     int frequeue)
+ {
+ 	struct request *req;
+-	struct buffer_head *bh;
+-        Scsi_Device * SDpnt;
+-	int nsect;
+-
++	char * leftovers = NULL;
++	Scsi_Device * SDpnt;
++	
+ 	ASSERT_LOCK(&io_request_lock, 0);
+ 
+ 	req = &SCpnt->request;
+@@ -372,47 +522,36 @@
+ 		printk(" I/O error: dev %s, sector %lu\n",
+ 		       kdevname(req->rq_dev), req->sector);
+ 	}
+-	do {
+-		if ((bh = req->bh) != NULL) {
+-			nsect = bh->b_size >> 9;
+-			blk_finished_io(nsect);
+-			req->bh = bh->b_reqnext;
+-			req->nr_sectors -= nsect;
+-			req->sector += nsect;
+-			bh->b_reqnext = NULL;
+-			sectors -= nsect;
+-			bh->b_end_io(bh, uptodate);
+-			if ((bh = req->bh) != NULL) {
+-				req->current_nr_sectors = bh->b_size >> 9;
+-				if (req->nr_sectors < req->current_nr_sectors) {
+-					req->nr_sectors = req->current_nr_sectors;
+-					printk("scsi_end_request: buffer-list destroyed\n");
+-				}
+-			}
+-		}
+-	} while (sectors && bh);
++
++	leftovers = NULL;
++	if (req->bh != NULL) {		/* Buffer head based request */
++		__scsi_collect_bh_sectors(req, uptodate, sectors, &leftovers);
++	} else if (req->kiobuf != NULL) { /* Kiobuf based request */
++		__scsi_collect_kio_sectors(req, uptodate, sectors, &leftovers);
++	} else {
++		panic("Both bh and kiobuf pointers are unset in request!\n");
++	}
+ 
+ 	/*
+ 	 * If there are blocks left over at the end, set up the command
+ 	 * to queue the remainder of them.
+ 	 */
+-	if (req->bh) {
++	if (leftovers != NULL) {
+                 request_queue_t *q;
+-
+-		if( !requeue )
+-		{
+-			return SCpnt;
+-		}
++	     
++                if( !requeue ) {
++                        return SCpnt;
++                }	
+ 
+                 q = &SCpnt->device->request_queue;
+-
+-		req->buffer = bh->b_data;
+-		/*
+-		 * Bleah.  Leftovers again.  Stick the leftovers in
+-		 * the front of the queue, and goose the queue again.
+-		 */
+-		scsi_queue_next_request(q, SCpnt);
+-		return SCpnt;
++	     
++                req->buffer = leftovers;
++                /*	
++                 * Bleah.  Leftovers again.  Stick the leftovers in
++                 * the front of the queue, and goose the queue again.
++                 */
++                scsi_queue_next_request(q, SCpnt);
++                return SCpnt;
+ 	}
+ 	/*
+ 	 * This request is done.  If there is someone blocked waiting for this
+@@ -422,6 +561,7 @@
+ 	if (req->sem != NULL) {
+ 		up(req->sem);
+ 	}
++	req_finished_io(req);
+ 	add_blkdev_randomness(MAJOR(req->rq_dev));
+ 
+         SDpnt = SCpnt->device;
+@@ -581,13 +721,13 @@
+ 		scsi_free(SCpnt->buffer, SCpnt->sglist_len);
+ 	} else {
+ 		if (SCpnt->buffer != SCpnt->request.buffer) {
+-			if (SCpnt->request.cmd == READ) {
+-				memcpy(SCpnt->request.buffer, SCpnt->buffer,
+-				       SCpnt->bufflen);
+-			}
+-			scsi_free(SCpnt->buffer, SCpnt->bufflen);
++		     if (SCpnt->request.cmd == READ) {
++			  memcpy(SCpnt->request.buffer, SCpnt->buffer,
++				 SCpnt->bufflen);
++		     }
++		     scsi_free(SCpnt->buffer, SCpnt->bufflen);
+ 		}
+-	}
++	   }
+ 
+ 	/*
+ 	 * Zero these out.  They now point to freed memory, and it is
+@@ -631,7 +771,7 @@
+ 		 * rest of the command, or start a new one.
+ 		 */
+ 		if (result == 0 || SCpnt == NULL ) {
+-			return;
++		     return;
+ 		}
+ 	}
+ 	/*
+@@ -815,7 +955,7 @@
+ 	Scsi_Device *SDpnt;
+ 	struct Scsi_Host *SHpnt;
+ 	struct Scsi_Device_Template *STpnt;
+-
++	
+ 	ASSERT_LOCK(&io_request_lock, 1);
+ 
+ 	SDpnt = (Scsi_Device *) q->queuedata;
+
+===========================================================================
+Index: linux/drivers/scsi/scsi_merge.c
+===========================================================================
+
+--- linux/drivers/scsi/scsi_merge.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/scsi/scsi_merge.c_1.26	Tue Apr  3 17:57:09 2001
+@@ -6,6 +6,7 @@
+  *                        Based upon conversations with large numbers
+  *                        of people at Linux Expo.
+  *	Support for dynamic DMA mapping: Jakub Jelinek (jakub@redhat.com).
++ *      Support for kiobuf-based I/O requests. [Chaitanya Tumuluri, chait@sgi.com]
+  */
+ 
+ /*
+@@ -90,7 +91,7 @@
+ 	printk("nr_segments is %x\n", req->nr_segments);
+ 	printk("counted segments is %x\n", segments);
+ 	printk("Flags %d %d\n", use_clustering, dma_host);
+-	for (bh = req->bh; bh->b_reqnext != NULL; bh = bh->b_reqnext) 
++	for (bh = req->bh; bh != NULL; bh = bh->b_reqnext)
+ 	{
+ 		printk("Segment 0x%p, blocks %d, addr 0x%lx\n",
+ 		       bh,
+@@ -298,9 +299,22 @@
+ 	SHpnt = SCpnt->host;
+ 	SDpnt = SCpnt->device;
+ 
+-	req->nr_segments = __count_segments(req, 
+-					    CLUSTERABLE_DEVICE(SHpnt, SDpnt),
+-					    SHpnt->unchecked_isa_dma, NULL);
++	if (req->bh){
++                req->nr_segments = __count_segments(req, 
++						 CLUSTERABLE_DEVICE(SHpnt, SDpnt),
++						 SHpnt->unchecked_isa_dma, NULL);
++	} else if (req->kiobuf){
++		/* Since there is no clustering/merging in kiobuf
++		 * requests, the nr_segments is simply a count of
++		 * the number of pages needing I/O. nr_segments is
++		 * updated in __scsi_collect_kio_sectors() called 
++		 * from scsi_end_request(), for the leftover case.
++		 * [chait@sgi.com]
++		 */
++		return;
++	} else {
++		panic("Both kiobuf and bh pointers are NULL!");
++	}
+ }
+ 
+ #define MERGEABLE_BUFFERS(X,Y) \
+@@ -743,6 +757,186 @@
+ MERGEREQFCT(scsi_merge_requests_fn_, 0, 0)
+ MERGEREQFCT(scsi_merge_requests_fn_c, 1, 0)
+ MERGEREQFCT(scsi_merge_requests_fn_dc, 1, 1)
++
++
++
++/*
++ * Function:    scsi_bh_sgl()
++ *
++ * Purpose:     Helper routine to construct S(catter) G(ather) L(ist)
++ *		assuming buffer_head-based request in the Scsi_Cmnd.
++ *
++ * Arguments:   SCpnt   - Command descriptor 
++ *              use_clustering - 1 if host uses clustering
++ *              dma_host - 1 if this host has ISA DMA issues (bus doesn't
++ *                      expose all of the address lines, so that DMA cannot
++ *                      be done from an arbitrary address).
++ *		sgpnt   - pointer to sgl
++ *
++ * Returns:     Number of sg segments in the sgl.
++ *
++ * Notes:       Only the SCpnt argument should be a non-constant variable.
++ *		This functionality was abstracted out of the original code
++ *		in __init_io().
++ */
++__inline static int scsi_bh_sgl(Scsi_Cmnd * SCpnt,
++			      int use_clustering,
++			      int dma_host,
++			      struct scatterlist * sgpnt)
++{
++	int count;
++	struct buffer_head * bh;
++	struct buffer_head * bhprev;
++	
++	bhprev = NULL;
++
++	for (count = 0, bh = SCpnt->request.bh; bh; bh = bh->b_reqnext) {
++		if (use_clustering && bhprev != NULL) {
++			if (dma_host &&	
++			    virt_to_phys(bhprev->b_data) - 1 == ISA_DMA_THRESHOLD) {
++				/* Nothing - fall through */
++			} else if (CONTIGUOUS_BUFFERS(bhprev, bh)) {
++				/*
++				 * This one is OK.  Let it go.  Note that we
++				 * do not have the ability to allocate
++				 * bounce buffer segments > PAGE_SIZE, so
++				 * for now we limit the thing.
++				 */
++				if( dma_host ) {
++#ifdef DMA_SEGMENT_SIZE_LIMITED
++					if( virt_to_phys(bh->b_data) - 1 < ISA_DMA_THRESHOLD
++					    || sgpnt[count - 1].length + bh->b_size <= PAGE_SIZE ) {
++						sgpnt[count - 1].length += bh->b_size;
++						bhprev = bh;
++						continue;
++					}
++#else
++					sgpnt[count - 1].length += bh->b_size;
++					bhprev = bh;
++					continue;
++#endif
++				} else {
++					sgpnt[count - 1].length += bh->b_size;
++					SCpnt->request_bufflen += bh->b_size;
++					bhprev = bh;
++					continue;
++				}
++			}
++		}
++		count++;
++		sgpnt[count - 1].address = bh->b_data;
++		sgpnt[count - 1].length += bh->b_size;
++		if (!dma_host) {
++			SCpnt->request_bufflen += bh->b_size;
++		}
++		bhprev = bh;
++	}
++
++	return count;
++}
++
++
++/*
++ * Function:    scsi_kio_sgl()
++ *
++ * Purpose:     Helper routine to construct S(catter) G(ather) L(ist)
++ *		assuming kiobuf-based request in the Scsi_Cmnd.
++ *
++ * Arguments:   SCpnt   - Command descriptor 
++ *              dma_host - 1 if this host has ISA DMA issues (bus doesn't
++ *                      expose all of the address lines, so that DMA cannot
++ *                      be done from an arbitrary address).
++ *		sgpnt   - pointer to sgl
++ *
++ * Returns:     Number of sg segments in the sgl.
++ *
++ * Notes:       Only the SCpnt argument should be a non-constant variable.
++ *		This functionality was created out of __ini_io() in the
++ *		original implementation for constructing the sgl for
++ *		kiobuf-based I/Os as well.
++ *
++ *		Constructs SCpnt->use_sg sgl segments for the kiobuf.
++ *
++ *		No clustering of pages is attempted unlike the buffer_head
++ *		case. Primarily because the pages in a kiobuf are unlikely to 
++ *		be contiguous. Bears checking.
++ */
++__inline static int scsi_kio_sgl(Scsi_Cmnd * SCpnt,
++			      int dma_host,
++			      struct scatterlist * sgpnt)
++{
++        int pgcnt = 0, nr_seg, curr_seg, nr_sectors, curr_offset;
++	unsigned int nr_bytes, total_bytes, sgl_seg_bytes;
++	unsigned long va;
++
++	curr_seg = SCpnt->use_sg; /* This many sgl segments */
++	nr_sectors = SCpnt->request.nr_sectors;
++	total_bytes = (nr_sectors << 9);
++	curr_offset = SCpnt->request.kiobuf->offset;
++	
++	/*
++	 * In the case of leftover requests, the kiobuf->length
++	 * remains the same, but req->nr_sectors would be smaller.
++	 * Use this difference to adjust curr_offset in this case. 
++	 * If not a leftover, the following makes no difference.
++	 */
++	curr_offset += (((SCpnt->request.kiobuf->length >> 9) - nr_sectors) << 9);
++	/* How far into the kiobuf is the offset? */
++	if (curr_offset >= PAGE_SIZE) {
++		pgcnt = (curr_offset >> PAGE_SHIFT);
++		curr_offset &= ~PAGE_MASK;
++	}
++
++	/*		
++	 * Reusing the pgcnt value from above:
++	 * Starting at the right page and offset, build curr_seg
++	 * sgl segments (one per page). Account for both a 
++	 * potentially partial last page and unrequired pages 
++	 * at the end of the kiobuf.
++	 */
++	nr_bytes = 0;
++	for (nr_seg = 0; nr_seg < curr_seg; nr_seg++) {
++		va = (unsigned long) page_address(SCpnt->request.kiobuf->maplist[pgcnt])
++			+ curr_offset;
++		++pgcnt;
++		
++		/*
++		 * If this is the first page, account for offset.
++		 * If this the final (maybe partial) page, get remainder.
++		 */
++		if (curr_offset != 0) {
++                        sgl_seg_bytes = (PAGE_SIZE - curr_offset) > total_bytes ?
++                                total_bytes : (PAGE_SIZE - curr_offset);
++                        curr_offset = 0;	
++		} else if((nr_bytes + PAGE_SIZE) > total_bytes) {
++                        sgl_seg_bytes = total_bytes - nr_bytes;
++		} else {	
++                        sgl_seg_bytes = PAGE_SIZE;
++		}
++		
++		nr_bytes += sgl_seg_bytes;
++		sgpnt[nr_seg].address = (char *)va;
++		sgpnt[nr_seg].alt_address = 0;
++		sgpnt[nr_seg].length = sgl_seg_bytes;
++
++		if (!dma_host)
++                        SCpnt->request_bufflen += sgl_seg_bytes;
++	}
++	/* Sanity Check */
++	if ((nr_bytes > total_bytes) ||
++	    (pgcnt > SCpnt->request.kiobuf->nr_pages)) {
++		printk(KERN_ERR
++		       "scsi_kio_sgl: sgl bytes[%d], request bytes[%d]\n"
++		       "scsi_kio_sgl: pgcnt[%d], kiobuf->pgcnt[%d]!\n",
++		       nr_bytes, total_bytes, pgcnt, SCpnt->request.kiobuf->nr_pages);
++		BUG();
++	}
++	return nr_seg;
++
++}
++
++
++
+ /*
+  * Function:    __init_io()
+  *
+@@ -775,6 +969,9 @@
+  *              gather list, the sg count in the request won't be valid
+  *              (mainly because we don't need queue management functions
+  *              which keep the tally uptodate.
++ *
++ *		Modified to handle kiobuf argument in the SCpnt->request
++ *		structure. 
+  */
+ __inline static int __init_io(Scsi_Cmnd * SCpnt,
+ 			      int sg_count_valid,
+@@ -782,7 +979,6 @@
+ 			      int dma_host)
+ {
+ 	struct buffer_head * bh;
+-	struct buffer_head * bhprev;
+ 	char		   * buff;
+ 	int		     count;
+ 	int		     i;
+@@ -797,13 +993,13 @@
+ 	 * needed any more.  Need to play with it and see if we hit the
+ 	 * panic.  If not, then don't bother.
+ 	 */
+-	if (!SCpnt->request.bh) {
++	if ((!SCpnt->request.bh && !SCpnt->request.kiobuf) ||
++	    (SCpnt->request.bh && SCpnt->request.kiobuf)) {
+ 		/* 
+-		 * Case of page request (i.e. raw device), or unlinked buffer 
+-		 * Typically used for swapping, but this isn't how we do
+-		 * swapping any more.
++		 * Case of unlinked buffer. Typically used for swapping,
++		 * but this isn't how we do swapping any more.
+ 		 */
+-		panic("I believe this is dead code.  If we hit this, I was wrong");
++	        panic("I believe this is dead code.  If we hit this, I was wrong");
+ #if 0
+ 		SCpnt->request_bufflen = SCpnt->request.nr_sectors << 9;
+ 		SCpnt->request_buffer = SCpnt->request.buffer;
+@@ -817,6 +1013,12 @@
+ 	req = &SCpnt->request;
+ 	/*
+ 	 * First we need to know how many scatter gather segments are needed.
++	 *
++	 * Redundant test per comment below indicating sg_count_valid is always
++	 * set to 1.(ll_rw_blk.c's estimate of req->nr_segments is always trusted).
++	 *
++	 * count is initialized in ll_rw_kio() for the kiobuf path and since these
++	 * requests are never merged, the counts are stay valid.
+ 	 */
+ 	if (!sg_count_valid) {
+ 		count = __count_segments(req, use_clustering, dma_host, NULL);
+@@ -835,17 +1037,30 @@
+ 	}
+ 	/*
+ 	 * Don't bother with scatter-gather if there is only one segment.
+-	 */
++	 */		
+ 	if (count == 1) {
+ 		this_count = SCpnt->request.nr_sectors;
+ 		goto single_segment;
+ 	}
+-	SCpnt->use_sg = count;
++	/* Check if size of the sgl would be greater than the size
++	 * of the host sgl table. In which case, limit the sgl size.
++	 * When the request sectors are harvested after completion of 
++	 * I/O in __scsi_collect_kio_sectors, the additional sectors 
++	 * will be reinjected into the request queue as a special cmd.
++	 * This will be done till all the request sectors are done.
++	 * [chait@sgi.com]
++	 */
++	if((SCpnt->request.kiobuf != NULL) &&
++	   (count > SCpnt->host->sg_tablesize)) {
++		count = SCpnt->host->sg_tablesize - 1;
++	}
+ 
++	SCpnt->use_sg = count;
+ 	/* 
+ 	 * Allocate the actual scatter-gather table itself.
+ 	 * scsi_malloc can only allocate in chunks of 512 bytes 
+ 	 */
++	
+ 	SCpnt->sglist_len = (SCpnt->use_sg
+ 			     * sizeof(struct scatterlist) + 511) & ~511;
+ 
+@@ -870,49 +1085,13 @@
+ 	memset(sgpnt, 0, SCpnt->sglist_len);
+ 	SCpnt->request_buffer = (char *) sgpnt;
+ 	SCpnt->request_bufflen = 0;
+-	bhprev = NULL;
+ 
+-	for (count = 0, bh = SCpnt->request.bh;
+-	     bh; bh = bh->b_reqnext) {
+-		if (use_clustering && bhprev != NULL) {
+-			if (dma_host &&
+-			    virt_to_phys(bhprev->b_data) - 1 == ISA_DMA_THRESHOLD) {
+-				/* Nothing - fall through */
+-			} else if (CONTIGUOUS_BUFFERS(bhprev, bh)) {
+-				/*
+-				 * This one is OK.  Let it go.  Note that we
+-				 * do not have the ability to allocate
+-				 * bounce buffer segments > PAGE_SIZE, so
+-				 * for now we limit the thing.
+-				 */
+-				if( dma_host ) {
+-#ifdef DMA_SEGMENT_SIZE_LIMITED
+-					if( virt_to_phys(bh->b_data) - 1 < ISA_DMA_THRESHOLD
+-					    || sgpnt[count - 1].length + bh->b_size <= PAGE_SIZE ) {
+-						sgpnt[count - 1].length += bh->b_size;
+-						bhprev = bh;
+-						continue;
+-					}
+-#else
+-					sgpnt[count - 1].length += bh->b_size;
+-					bhprev = bh;
+-					continue;
+-#endif
+-				} else {
+-					sgpnt[count - 1].length += bh->b_size;
+-					SCpnt->request_bufflen += bh->b_size;
+-					bhprev = bh;
+-					continue;
+-				}
+-			}
+-		}
+-		count++;
+-		sgpnt[count - 1].address = bh->b_data;
+-		sgpnt[count - 1].length += bh->b_size;
+-		if (!dma_host) {
+-			SCpnt->request_bufflen += bh->b_size;
+-		}
+-		bhprev = bh;
++	if (SCpnt->request.bh){
++		count = scsi_bh_sgl(SCpnt, use_clustering, dma_host, sgpnt);
++	} else if (SCpnt->request.kiobuf) {
++		count = scsi_kio_sgl(SCpnt, dma_host, sgpnt);
++	} else {
++		panic("Yowza! Both kiobuf and buffer_head pointers are null!");
+ 	}
+ 
+ 	/*
+@@ -1007,6 +1186,17 @@
+ 	scsi_free(SCpnt->request_buffer, SCpnt->sglist_len);
+ 
+ 	/*
++	 * Shouldn't ever get here for a kiobuf request.
++	 *
++	 * Since each segment is a page and also, we couldn't
++	 * allocate bounce buffers for even the first page,
++	 * this means that the DMA buffer pool is exhausted!
++	 */
++	if (SCpnt->request.kiobuf){
++		dma_exhausted(SCpnt, 0);
++	}
++
++	/*
+ 	 * Make an attempt to pick up as much as we reasonably can.
+ 	 * Just keep adding sectors until the pool starts running kind of
+ 	 * low.  The limit of 30 is somewhat arbitrary - the point is that
+@@ -1041,34 +1231,33 @@
+ 	 * segment.  Possibly the entire request, or possibly a small
+ 	 * chunk of the entire request.
+ 	 */
+-	bh = SCpnt->request.bh;
+ 	buff = SCpnt->request.buffer;
+ 
+ 	if (dma_host) {
+-		/*
+-		 * Allocate a DMA bounce buffer.  If the allocation fails, fall
+-		 * back and allocate a really small one - enough to satisfy
+-		 * the first buffer.
+-		 */
+-		if (virt_to_phys(SCpnt->request.bh->b_data)
+-		    + (this_count << 9) - 1 > ISA_DMA_THRESHOLD) {
+-			buff = (char *) scsi_malloc(this_count << 9);
+-			if (!buff) {
+-				printk("Warning - running low on DMA memory\n");
+-				this_count = SCpnt->request.current_nr_sectors;
+-				buff = (char *) scsi_malloc(this_count << 9);
+-				if (!buff) {
+-					dma_exhausted(SCpnt, 0);
+-				}
+-			}
+-			if (SCpnt->request.cmd == WRITE)
+-				memcpy(buff, (char *) SCpnt->request.buffer, this_count << 9);
+-		}
++	     /*
++	      * Allocate a DMA bounce buffer.  If the allocation fails, fall
++	      * back and allocate a really small one - enough to satisfy
++	      * the first buffer.
++	      */
++	     if (virt_to_phys(SCpnt->request.buffer) + (this_count << 9) - 1 >
++		 ISA_DMA_THRESHOLD) {
++		  buff = (char *) scsi_malloc(this_count << 9);
++		  if (!buff) {
++		       printk("Warning - running low on DMA memory\n");
++		       this_count = SCpnt->request.current_nr_sectors;
++		       buff = (char *) scsi_malloc(this_count << 9);
++		       if (!buff) {
++			    dma_exhausted(SCpnt, 0);
++		       }	
++		  }
++		  if (SCpnt->request.cmd == WRITE)
++		       memcpy(buff, (char *) SCpnt->request.buffer, this_count << 9);
++	     }	
+ 	}
+ 	SCpnt->request_bufflen = this_count << 9;
+ 	SCpnt->request_buffer = buff;
+ 	SCpnt->use_sg = 0;
+-	return 1;
++	return 1;		
+ }
+ 
+ #define INITIO(_FUNCTION, _VALID, _CLUSTER, _DMA)	\
+
+===========================================================================
+Index: linux/drivers/scsi/sd.c
+===========================================================================
+
+--- linux/drivers/scsi/sd.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/drivers/scsi/sd.c_1.33	Tue Apr  3 17:57:09 2001
+@@ -590,7 +590,10 @@
+ 			(SCpnt->sense_buffer[4] << 16) |
+ 			(SCpnt->sense_buffer[5] << 8) |
+ 			SCpnt->sense_buffer[6];
+-			if (SCpnt->request.bh != NULL)
++			/* Tweak to support kiobuf-based I/O requests, [chait@sgi.com] */
++			if (SCpnt->request.kiobuf != NULL)
++				block_sectors = SCpnt->request.kiobuf->length >> 9;
++			else if (SCpnt->request.bh != NULL)
+ 				block_sectors = SCpnt->request.bh->b_size >> 9;
+ 			switch (SCpnt->device->sector_size) {
+ 			case 1024:
+
+===========================================================================
+Index: linux/fs/buffer.c
+===========================================================================
+
+--- linux/fs/buffer.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/fs/buffer.c_1.59	Tue Apr  3 17:57:09 2001
+@@ -2078,6 +2078,34 @@
+ }
+ 
+ /*
++ * Clean up the bounce buffers potentially used by brw_kiovec. All of
++ * the kiovec's bounce buffers must be cleared of temporarily allocated
++ * bounce pages, but only READ pages for whom IO completed successfully
++ * can actually be transferred back to user space.
++ */
++
++void cleanup_bounce_buffers(int rw, int nr, struct kiobuf *iovec[],
++			    int transferred)
++{
++	int i;
++	for (i = 0; i < nr; i++) {
++		struct kiobuf *iobuf = iovec[i];
++		if (iobuf->bounced) {
++			if (transferred > 0 && !(rw & WRITE))
++				kiobuf_copy_bounce(iobuf, COPY_FROM_BOUNCE,
++						   transferred);	
++
++			clear_kiobuf_bounce_pages(iobuf);
++		}
++		transferred -= iobuf->length;
++	}
++
++        /* Your vanilla paranoia */
++        if (transferred > 0)
++                BUG();
++}
++
++/*
+  * Start I/O on a physical range of kernel memory, defined by a vector
+  * of kiobuf structs (much like a user-space iovec list).
+  *
+@@ -2126,6 +2154,12 @@
+ 	bufind = bhind = transferred = err = 0;
+ 	for (i = 0; i < nr; i++) {
+ 		iobuf = iovec[i];
++		err = setup_kiobuf_bounce_pages(iobuf, GFP_USER);
++		if (err)
++			goto finished;
++		if (rw & WRITE)
++			kiobuf_copy_bounce(iobuf, COPY_TO_BOUNCE, -1);
++
+ 		offset = iobuf->offset;
+ 		length = iobuf->length;
+ 		iobuf->errno = 0;
+@@ -2197,6 +2231,8 @@
+ 	}
+ 
+  finished:
++	cleanup_bounce_buffers(rw, nr, iovec, transferred);
++
+ 	if (transferred)
+ 		return transferred;
+ 	return err;
+@@ -2209,6 +2245,14 @@
+ 		__put_unused_buffer_head(bh[i]);
+ 	}
+ 	spin_unlock(&unused_list_lock);
++
++        /*
++         * This deallocates bounce pages for current kiobuf. Then,
++         * cleanup_bounce_buffers() copies from previously bounced
++         * kiobufs in the iovec[] and deallocates those bounce pages.
++         */
++	clear_kiobuf_bounce_pages(iobuf);
++
+ 	goto finished;
+ }
+ 
+
+===========================================================================
+Index: linux/fs/iobuf.c
+===========================================================================
+
+--- linux/fs/iobuf.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/fs/iobuf.c_1.16	Tue Apr  3 17:57:09 2001
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/iobuf.h>
+ #include <linux/slab.h>
++#include <linux/highmem.h>
+ 
+ static kmem_cache_t *kiobuf_cachep;
+ 
+@@ -41,6 +42,7 @@
+ 	init_waitqueue_head(&iobuf->wait_queue);
+ 	iobuf->array_len = KIO_STATIC_PAGES;
+ 	iobuf->maplist   = iobuf->map_array;
++	iobuf->orig_maplist = iobuf->orig_map_array;
+ }
+ 
+ int alloc_kiovec(int nr, struct kiobuf **bufp)
+@@ -61,6 +63,27 @@
+ 	return 0;
+ }
+ 
++void clear_kiobuf_bounce_pages(struct kiobuf *iobuf)
++{
++	int i;
++
++	if (!iobuf->bounced)
++		return;
++
++	for (i = 0; i < iobuf->nr_pages; i++) {
++		struct page *page = iobuf->orig_maplist[i];
++		if (page) {
++                        page = iobuf->maplist[i];
++                        iobuf->maplist[i] = iobuf->orig_maplist[i];
++			__free_pages(page, 0);
++			iobuf->orig_maplist[i] = NULL;
++                }
++	}
++	iobuf->bounced = 0;
++}
++
++
++
+ void free_kiovec(int nr, struct kiobuf **bufp) 
+ {
+ 	int i;
+@@ -68,17 +91,22 @@
+ 	
+ 	for (i = 0; i < nr; i++) {
+ 		iobuf = bufp[i];
++		clear_kiobuf_bounce_pages(iobuf);
+ 		if (iobuf->locked)
+ 			unlock_kiovec(1, &iobuf, iobuf->nr_pages);
+-		if (iobuf->array_len > KIO_STATIC_PAGES)
++
++		if (iobuf->array_len > KIO_STATIC_PAGES) {
+ 			kfree (iobuf->maplist);
++			kfree (iobuf->orig_maplist);
++		}
++		
+ 		kmem_cache_free(kiobuf_cachep, bufp[i]);
+ 	}
+ }
+ 
+ int expand_kiobuf(struct kiobuf *iobuf, int wanted)
+ {
+-	struct page ** maplist;
++	struct page **maplist, **orig_maplist;
+ 	
+ 	if (iobuf->array_len >= wanted)
+ 		return 0;
+@@ -87,23 +115,215 @@
+ 		kmalloc(wanted * sizeof(struct page **), GFP_KERNEL);
+ 	if (!maplist)
+ 		return -ENOMEM;
+-
++	else {
++		orig_maplist = (struct page **) 
++			kmalloc(wanted * sizeof(struct page **), GFP_KERNEL);
++		if (!orig_maplist)
++			return -ENOMEM;
++	}
++		
+ 	/* Did it grow while we waited? */
+ 	if (iobuf->array_len >= wanted) {
+ 		kfree(maplist);
++		kfree(orig_maplist);
+ 		return 0;
+ 	}
+-	
++
++	memset(maplist, 0, wanted * sizeof(struct page **));
++	memset(orig_maplist, 0, wanted * sizeof(struct page **));
+ 	memcpy (maplist, iobuf->maplist, iobuf->array_len * sizeof(struct page **));
++	memcpy (orig_maplist, iobuf->orig_maplist, iobuf->array_len * sizeof(struct page **));
+ 
+-	if (iobuf->array_len > KIO_STATIC_PAGES)
++	if (iobuf->array_len > KIO_STATIC_PAGES) {
+ 		kfree (iobuf->maplist);
++		kfree (iobuf->orig_maplist);
++	}
+ 	
+-	iobuf->maplist   = maplist;
++	iobuf->maplist = maplist;
++	iobuf->orig_maplist = orig_maplist;
+ 	iobuf->array_len = wanted;
+ 	return 0;
+ }
+ 
++/*
++ * Test whether a given page from the bounce buffer matches the given
++ * gfp_mask. Return true if a bounce buffer is required for this
++ * page. 
++ */
++
++static inline int test_bounce_page(struct page * map, int gfp_mask)
++{
++        /*
++         * Unmapped pages from PCI memory or HIGHMEM pages always need a
++         * bounce buffer unless the caller is prepared to accept
++         * GFP_HIGHMEM pages.
++         */	
++ 
++        if (PageHighMem(map))
++                /*
++                 * Careful, the following must return the right value
++                 * even if CONFIG_HIGHMEM is not set
++                 */
++                return !(gfp_mask & __GFP_HIGHMEM);
++ 
++        /*
++         * Possibly, Non-DMA-capable page and needs
++         * bounce buffers if GFP_DMA is requested
++         */
++        return gfp_mask & __GFP_DMA;
++}
++
++
++
++/*
++ * Note: orig_maplist[] contains only original pages.
++ * 	 maplist[] contains both original and bounce-pages.
++ */
++int setup_kiobuf_bounce_pages(struct kiobuf *iobuf, int gfp_mask)
++{
++        int i;
++#if CONFIG_HIGHMEM
++	int try_count=0;
++#endif
++ 
++        clear_kiobuf_bounce_pages(iobuf);
++ 
++        for (i = 0; i < iobuf->nr_pages; i++) {
++                struct page *map = iobuf->maplist[i];
++                struct page *bounce_page;	
++
++		bounce_page = NULL;	
++                if (!test_bounce_page(map, gfp_mask)) {
++                        iobuf->orig_maplist[i] = 0;
++                        continue;
++                }
++#if CONFIG_HIGHMEM
++ try_again:
++                bounce_page = alloc_pages(GFP_KERNEL, 0);
++		if (!bounce_page) {
++			if (try_count < 8) { /* Arbit. limit */
++				++try_count;
++				wakeup_bdflush(1);
++				current->policy |= SCHED_YIELD;
++				schedule();		
++				goto try_again;
++			} else if (try_count == 8) {
++				run_task_queue(&tq_disk);
++				++try_count;
++				goto try_again;
++			} else 
++				goto error;
++		}
++                iobuf->orig_maplist[i] = iobuf->maplist[i];
++                iobuf->maplist[i] = bounce_page;
++                iobuf->bounced = 1;
++#else
++		printk("Bouncing needed in non-highmem kernel?!\n");
++		BUG();
++#endif
++        }
++        return 0;
++
++#if CONFIG_HIGHMEM
++ error:
++	printk("Failed bounce-page allocation!\n");
++        clear_kiobuf_bounce_pages(iobuf);
++        return -ENOMEM;
++#endif
++}
++/*
++ * Copy a bounce buffer. For completion of partially-failed read IOs,
++ * we need to be able to place an upper limit on the data successfully
++ * transferred from bounce buffers to the user's own buffers. 
++ */
++
++void kiobuf_copy_bounce(struct kiobuf *iobuf, int direction, int max)
++{
++        int i;
++        int offset, length;
++ 
++        if (!iobuf->bounced)
++                return;
++ 
++        offset = iobuf->offset;
++        length = iobuf->length;
++        if (max >= 0 && length > max)
++                length = max;
++ 
++        i = 0;
++        if (offset > PAGE_SIZE) {
++                i = (offset >> PAGE_SHIFT);
++                offset &= ~PAGE_MASK;
++        }
++ 
++        for (; i < iobuf->nr_pages && length > 0; i++) {
++                struct page *page = iobuf->orig_maplist[i];
++                int pagelen = length;
++ 
++                if (page) {
++#if CONFIG_HIGHMEM
++			struct page *bounce_page = iobuf->maplist[i];
++			unsigned long kin, kout;
++			
++			/* If this is the first page, account for offset. */
++			if (offset && ( (PAGE_SIZE - offset) < pagelen ))
++				pagelen = PAGE_SIZE - offset;
++			else if (pagelen > PAGE_SIZE)
++				pagelen = PAGE_SIZE;
++
++			/*
++			 * Ouch...kmap() may be called from interrupt
++			 * context. Song and dance to avoid re-entrancy.
++			 */
++			if (in_interrupt()) {
++				unsigned long flags;
++				
++				__save_flags(flags);
++				__cli();	
++
++				if (direction == COPY_TO_BOUNCE) {
++					kout = (unsigned long) page_address(bounce_page);
++					kin = kmap_atomic(page, KM_BOUNCE_WRITE);
++				} else {
++					kin = (unsigned long) page_address(bounce_page);
++					kout = kmap_atomic(page, KM_BOUNCE_READ);
++				}
++
++				memcpy((char *) (kout+offset), 
++				       (char *) (kin+offset),
++				       pagelen);
++
++				if (direction == COPY_TO_BOUNCE)
++					kunmap_atomic(kin, KM_BOUNCE_WRITE);
++				else
++					kunmap_atomic(kout, KM_BOUNCE_READ);
++				__restore_flags(flags);
++			} else {
++				
++				if (direction == COPY_TO_BOUNCE) {
++					kin = kmap(page);
++					kout = (unsigned long) page_address(bounce_page);
++				} else {
++					kout = kmap(page);
++					kin = (unsigned long) page_address(bounce_page);
++				}					
++				memcpy((char *) (kout+offset), 
++				       (char *) (kin+offset),
++				       pagelen);
++				kunmap(page);
++                        }
++#else
++			printk("Found bounce pages in non-highmem kernel!\n");
++			BUG();
++#endif
++                }
++ 
++                length -= pagelen;
++                offset = 0;
++        }
++}
++
++
+ 
+ void kiobuf_wait_for_io(struct kiobuf *kiobuf)
+ {
+@@ -124,6 +344,3 @@
+ 	tsk->state = TASK_RUNNING;
+ 	remove_wait_queue(&kiobuf->wait_queue, &wait);
+ }
+-
+-
+-
+
+===========================================================================
+Index: linux/fs/pagebuf/page_buf.c
+===========================================================================
+
+--- linux/fs/pagebuf/page_buf.c	Tue Apr  3 17:54:39 2001
++++ /usr/tmp/TmpDir.30941-0/linux/fs/pagebuf/page_buf.c_1.71	Tue Apr  3 17:57:09 2001
+@@ -178,6 +178,7 @@
+ 
+ struct pbstats pbstats;
+ 
++#define KIOBUF_IO
+ #define REMAPPING_SUPPORT
+ 
+ #ifdef REMAPPING_SUPPORT
+@@ -1346,7 +1347,7 @@
+ 		atomic_inc(&PBP(pb)->pb_io_remaining);
+ 
+ 		for (itr=0; itr < cnt; itr++){
+-			generic_make_request(rw, bufferlist[itr]);
++			generic_make_request(rw, bufferlist[itr], NULL, 0, 0, 0);
+ 		}		  
+ 	} else {
+ 		if (psync)
+
+===========================================================================
+Index: linux/fs/partitions/check.c
+===========================================================================
+
+--- linux/fs/partitions/check.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/fs/partitions/check.c_1.21	Tue Apr  3 17:57:09 2001
+@@ -39,6 +39,7 @@
+ extern void initrd_load(void);
+ 
+ struct gendisk *gendisk_head;
++struct gendisk *major_gendisk[MAX_BLKDEV];
+ int warn_no_part = 1; /*This is ugly: should make genhd removable media aware*/
+ 
+ static int (*check_part[])(struct gendisk *hd, kdev_t dev, unsigned long first_sect, int first_minor) = {
+@@ -239,12 +240,17 @@
+ }
+ 
+ #ifdef CONFIG_PROC_FS
++/* Normalise the disk performance stats to a notional timer tick of
++   1ms. */
++#define MSEC(x) ((x) * 1000 / HZ)
++
+ int get_partition_list(char *page, char **start, off_t offset, int count)
+ {
+ 	struct gendisk *dsk;
++	struct hd_struct *hd;
+ 	int len;
+ 
+-	len = sprintf(page, "major minor  #blocks  name\n\n");
++	len = sprintf(page, "major minor  #blocks  name     rio rmerge rsect ruse wio wmerge wsect wuse running use aveq\n\n");
+ 	for (dsk = gendisk_head; dsk; dsk = dsk->next) {
+ 		int n;
+ 
+@@ -252,10 +258,22 @@
+ 			if (dsk->part[n].nr_sects) {
+ 				char buf[64];
+ 
+-				len += sprintf(page + len,
+-					       "%4d  %4d %10d %s\n",
++				hd = &dsk->part[n];
++				disk_round_stats(hd);
++  				len += sprintf(page + len,
++					       "%4d  %4d %10d %s "
++					       "%d %d %d %d %d %d %d %d %d %d %d\n",
+ 					       dsk->major, n, dsk->sizes[n],
+-					       disk_name(dsk, n, buf));
++					       disk_name(dsk, n, buf),
++					       hd->rd_ios, hd->rd_merges,
++					       hd->rd_sectors,
++					       MSEC(hd->rd_ticks),
++					       hd->wr_ios, hd->wr_merges,
++					       hd->wr_sectors,
++					       MSEC(hd->wr_ticks),
++					       hd->ios_in_flight,
++					       MSEC(hd->io_ticks),
++					       MSEC(hd->aveq));
+ 				if (len < offset)
+ 					offset -= len, len = 0;
+ 				else if (len >= offset + count)
+@@ -409,6 +427,7 @@
+ 	if (!gdev)
+ 		return;
+ 	grok_partitions(gdev, MINOR(dev)>>gdev->minor_shift, minors, size);
++ 	major_gendisk[MAJOR(dev)] = gdev;
+ }
+ 
+ void grok_partitions(struct gendisk *dev, int drive, unsigned minors, long size)
+
+===========================================================================
+Index: linux/fs/xfs/linux/xfs_super.c
+===========================================================================
+
+--- linux/fs/xfs/linux/xfs_super.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/fs/xfs/linux/xfs_super.c_1.112	Tue Apr  3 17:57:10 2001
+@@ -78,6 +78,9 @@
+ #define MNTOPT_QUOTANOENF  "qnoenforce" /* same as uqnoenforce */
+ #define MNTOPT_RO       "ro"            /* read only */
+ #define MNTOPT_RW       "rw"            /* read/write */
++#define MNTOPT_NOKIO    "nokio"         /* no kiobuf io */
++#define MNTOPT_KIO      "kio"           /* use kiobuf io */
++#define MNTOPT_KIOCLUSTER "kiocluster"  /* use kiobuf io - with clustering */
+ 
+ STATIC int
+ mountargs_xfs(
+@@ -221,6 +224,10 @@
+ 			args->flags |= MS_RDONLY;
+ 		} else if (!strcmp(this_char, MNTOPT_NOSUID)) {
+ 			args->flags |= MS_NOSUID;
++		} else if (!strcmp(this_char, MNTOPT_KIO)) {
++			args->flags |= MS_KIOBUFIO;
++		} else if (!strcmp(this_char, MNTOPT_KIOCLUSTER)) {
++			args->flags |= MS_KIOBUFIO;
+ 		} else {
+ 			printk(
+ 			"mount: unknown mount option \"%s\".\n", this_char);
+@@ -365,6 +372,12 @@
+ 	memset(args, 0, sizeof(struct xfs_args));
+ 	if (mountargs_xfs((char *)data, args) != 0) {
+ 		return NULL;
++	}
++	/* check to see if kio is suppose to be on for this mount */
++	if (args->flags & MS_KIOBUFIO){
++		sb->s_flags |= MS_KIOBUFIO;
++		printk("XFS (dev: %d/%d) mounting with kiobuf I/O\n",
++				MAJOR(sb->s_dev),MINOR(sb->s_dev));
+ 	}
+ 
+ 	args->fsname = uap->spec;
+
+===========================================================================
+Index: linux/include/linux/blkdev.h
+===========================================================================
+
+--- linux/include/linux/blkdev.h	Tue Apr  3 17:35:15 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/blkdev.h_1.29	Tue Apr  3 17:57:10 2001
+@@ -6,6 +6,7 @@
+ #include <linux/genhd.h>
+ #include <linux/tqueue.h>
+ #include <linux/list.h>
++#include <linux/iobuf.h>
+ 
+ struct request_queue;
+ typedef struct request_queue request_queue_t;
+@@ -33,15 +34,17 @@
+ 	kdev_t rq_dev;
+ 	int cmd;		/* READ or WRITE */
+ 	int errors;
++	unsigned long start_time;
+ 	unsigned long sector;
+ 	unsigned long nr_sectors;
+-	unsigned long hard_sector, hard_nr_sectors;
++	unsigned long hard_sector, hard_nr_sectors, hard_cur_sectors;
+ 	unsigned int nr_segments;
+ 	unsigned int nr_hw_segments;
+ 	unsigned long current_nr_sectors;
+ 	void * special;
+ 	char * buffer;
+ 	struct semaphore * sem;
++	struct kiobuf * kiobuf;
+ 	struct buffer_head * bh;
+ 	struct buffer_head * bhtail;
+ 	request_queue_t *q;
+@@ -59,7 +62,9 @@
+ 				 int);
+ typedef void (request_fn_proc) (request_queue_t *q);
+ typedef request_queue_t * (queue_proc) (kdev_t dev);
+-typedef int (make_request_fn) (request_queue_t *q, int rw, struct buffer_head *bh);
++typedef int (make_request_fn) (request_queue_t *q, int rw, struct buffer_head *bh,
++			       struct kiobuf *kiobuf, kdev_t dev, unsigned int sector,
++			       unsigned int count);
+ typedef void (plug_device_fn) (request_queue_t *q, kdev_t device);
+ typedef void (unplug_device_fn) (void *q);
+ 
+@@ -150,7 +155,9 @@
+ extern struct blk_dev_struct blk_dev[MAX_BLKDEV];
+ extern void grok_partitions(struct gendisk *dev, int drive, unsigned minors, long size);
+ extern void register_disk(struct gendisk *dev, kdev_t first, unsigned minors, struct block_device_operations *ops, long size);
+-extern void generic_make_request(int rw, struct buffer_head * bh);
++extern void generic_make_request(int rw, struct buffer_head * bh,
++				 struct kiobuf * kiobuf, kdev_t dev,
++				 unsigned long blkocknr, size_t blksize);
+ extern request_queue_t *blk_get_queue(kdev_t dev);
+ extern inline request_queue_t *__blk_get_queue(kdev_t dev);
+ extern void blkdev_release_request(struct request *);
+
+===========================================================================
+Index: linux/include/linux/fs.h
+===========================================================================
+
+--- linux/include/linux/fs.h	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/fs.h_1.87	Tue Apr  3 17:57:10 2001
+@@ -28,6 +28,7 @@
+ 
+ struct poll_table_struct;
+ 
++struct kiobuf;
+ 
+ /*
+  * It's silly to have NR_OPEN bigger than NR_FILE, but you can change
+@@ -116,6 +117,8 @@
+ #define MS_NODIRATIME	2048	/* Do not update directory access times */
+ #define MS_BIND		4096
+ 
++#define MS_KIOBUFIO (1<<17) /* mount flag; use KIOBUF */
++
+ /*
+  * Flags that can be altered by MS_REMOUNT
+  */
+@@ -158,6 +161,7 @@
+ #define IS_NOEXEC(inode)	__IS_FLG(inode, MS_NOEXEC)
+ #define IS_SYNC(inode)		(__IS_FLG(inode, MS_SYNCHRONOUS) || ((inode)->i_flags & S_SYNC))
+ #define IS_MANDLOCK(inode)	__IS_FLG(inode, MS_MANDLOCK)
++#define IS_KIOBUFIO(inode)	__IS_FLG(inode, MS_KIOBUFIO)
+ 
+ #define IS_QUOTAINIT(inode)	((inode)->i_flags & S_QUOTA)
+ #define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
+@@ -1260,6 +1264,8 @@
+ extern struct buffer_head * get_hash_table(kdev_t, int, int);
+ extern struct buffer_head * getblk(kdev_t, int, int);
+ extern void ll_rw_block(int, int, struct buffer_head * bh[]);
++extern void ll_rw_kio(int, struct kiobuf *, kdev_t, unsigned long,
++			size_t, int *);
+ extern void submit_bh(int, struct buffer_head *);
+ extern int is_read_only(kdev_t);
+ extern void __brelse(struct buffer_head *);
+
+===========================================================================
+Index: linux/include/linux/genhd.h
+===========================================================================
+
+--- linux/include/linux/genhd.h	Tue Apr  3 17:35:15 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/genhd.h_1.11	Tue Apr  3 17:57:10 2001
+@@ -51,6 +51,22 @@
+ 	long start_sect;
+ 	long nr_sects;
+ 	devfs_handle_t de;              /* primary (master) devfs entry  */
++
++	/* Performance stats: */
++	unsigned int ios_in_flight;
++	unsigned int io_ticks;
++	unsigned int last_idle_time;
++	unsigned int last_queue_change;
++	unsigned int aveq;
++	
++	unsigned int rd_ios;
++	unsigned int rd_merges;
++	unsigned int rd_ticks;
++	unsigned int rd_sectors;
++	unsigned int wr_ios;
++	unsigned int wr_merges;
++	unsigned int wr_ticks;
++	unsigned int wr_sectors;	
+ };
+ 
+ #define GENHD_FL_REMOVABLE  1
+@@ -75,6 +91,8 @@
+ };
+ #endif  /*  __KERNEL__  */
+ 
++extern struct gendisk *major_gendisk[];
++
+ #ifdef CONFIG_SOLARIS_X86_PARTITION
+ 
+ #define SOLARIS_X86_NUMSLICE	8
+@@ -232,6 +250,19 @@
+ extern struct gendisk *gendisk_head;	/* linked list of disks */
+ 
+ char *disk_name (struct gendisk *hd, int minor, char *buf);
++
++/*
++ * disk_round_stats is used to round off the IO statistics for a disk
++ * for a complete clock tick.
++ */
++void disk_round_stats(struct hd_struct *hd);
++
++/* 
++ * Account for the completion of an IO request (used by drivers which 
++ * bypass the normal end_request processing) 
++ */
++struct request;
++void req_finished_io(struct request *);
+ 
+ extern void devfs_register_partitions (struct gendisk *dev, int minor,
+ 				       int unregister);
+
+===========================================================================
+Index: linux/include/linux/ide.h
+===========================================================================
+
+--- linux/include/linux/ide.h	Tue Apr  3 17:31:50 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/ide.h_1.27	Tue Apr  3 17:57:10 2001
+@@ -498,6 +498,7 @@
+ 	struct request		*rq;	/* current request */
+ 	struct timer_list	timer;	/* failsafe timer */
+ 	struct request		wrq;	/* local copy of current write rq */
++	int			kio_offset;	/* loccal kiobuf offset */
+ 	unsigned long		poll_timeout;	/* timeout value during long polls */
+ 	ide_expiry_t		*expiry;	/* queried upon timeouts */
+ } ide_hwgroup_t;
+@@ -657,6 +658,7 @@
+ #include <linux/blk.h>
+ 
+ void ide_end_request(byte uptodate, ide_hwgroup_t *hwgroup);
++int ide_end_kio_request(struct request *rq, int uptodate, int sectors);
+ 
+ /*
+  * This is used for (nearly) all data transfers from/to the IDE interface
+
+===========================================================================
+Index: linux/include/linux/iobuf.h
+===========================================================================
+
+--- linux/include/linux/iobuf.h	Tue Apr  3 17:49:57 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/iobuf.h_1.10	Tue Apr  3 17:57:10 2001
+@@ -43,17 +43,21 @@
+ 	 * region, there won't necessarily be page structs defined for
+ 	 * every address. */
+ 
+-	struct page **	maplist;
+-
+-	unsigned int	locked : 1;	/* If set, pages has been locked */
+-	
++	struct page **	maplist;	/* Both orig. pages and bounce-pages */
++        struct page **  orig_maplist;   /* Orig. pages which've been bounced */
++        
++	unsigned int	locked : 1;	/* If set, pages have been locked */
++	unsigned int    bounced : 1;    /* If set, pages have been bounced */
++        
+ 	/* Always embed enough struct pages for 64k of IO */
+ 	struct page *	map_array[KIO_STATIC_PAGES];
++	struct page *	orig_map_array[KIO_STATIC_PAGES];
+ 
+ 	/* Dynamic state for IO completion: */
+ 	atomic_t	io_count;	/* IOs still in progress */
+ 	int		errno;		/* Status of completed IO */
+ 	void		(*end_io) (struct kiobuf *); /* Completion callback */
++	void            *k_dev_id;  	/* Store kiovec (or pagebuf) here */
+ 	wait_queue_head_t wait_queue;
+ };
+ 
+@@ -76,9 +80,21 @@
+ int	expand_kiobuf(struct kiobuf *, int);
+ void	kiobuf_wait_for_io(struct kiobuf *);
+ 
++int setup_kiobuf_bounce_pages(struct kiobuf *, int gfp_mask);
++void clear_kiobuf_bounce_pages(struct kiobuf *);
++void kiobuf_copy_bounce(struct kiobuf *, int direction, int max);
++
++/* Direction codes for kiobuf_copy_bounce: */
++enum {
++        COPY_TO_BOUNCE,
++        COPY_FROM_BOUNCE
++};
++
+ /* fs/buffer.c */
+ 
+ int	brw_kiovec(int rw, int nr, struct kiobuf *iovec[], 
+ 		   kdev_t dev, unsigned long b[], int size);
++void	cleanup_bounce_buffers(int rw, int nr, struct kiobuf *iovec[],
++                               int transferred);
+ 
+ #endif /* __LINUX_IOBUF_H */
+
+===========================================================================
+Index: linux/include/linux/major.h
+===========================================================================
+
+--- linux/include/linux/major.h	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/include/linux/major.h_1.24	Tue Apr  3 17:57:10 2001
+@@ -167,8 +167,23 @@
+   (SCSI_DISK_MAJOR(M)	\
+    || (M) == SCSI_CDROM_MAJOR)
+ 
+-static __inline__ int scsi_blk_major(int m) {
++static inline int scsi_blk_major(int m)
++{
+ 	return SCSI_BLK_MAJOR(m);
++}
++
++/*
++ * Tests for IDE devices
++ */
++#define IDE_DISK_MAJOR(M)	((M) == IDE0_MAJOR || (M) == IDE1_MAJOR || \
++				(M) == IDE2_MAJOR || (M) == IDE3_MAJOR || \
++				(M) == IDE4_MAJOR || (M) == IDE5_MAJOR || \
++				(M) == IDE6_MAJOR || (M) == IDE7_MAJOR || \
++				(M) == IDE8_MAJOR || (M) == IDE9_MAJOR)
++
++static inline int ide_blk_major(int m)
++{
++	return IDE_DISK_MAJOR(m);
+ }
+ 
+ #endif
+
+===========================================================================
+Index: linux/kernel/ksyms.c
+===========================================================================
+
+--- linux/kernel/ksyms.c	Tue Apr  3 17:28:04 2001
++++ /usr/tmp/TmpDir.30941-0/linux/kernel/ksyms.c_1.82	Tue Apr  3 17:57:10 2001
+@@ -423,6 +423,10 @@
+ EXPORT_SYMBOL(unlock_kiovec);
+ EXPORT_SYMBOL(brw_kiovec);
+ EXPORT_SYMBOL(kiobuf_wait_for_io);
++EXPORT_SYMBOL(setup_kiobuf_bounce_pages);
++EXPORT_SYMBOL(clear_kiobuf_bounce_pages);
++EXPORT_SYMBOL(kiobuf_copy_bounce);
++EXPORT_SYMBOL(cleanup_bounce_buffers);
+ 
+ /* dma handling */
+ EXPORT_SYMBOL(request_dma);

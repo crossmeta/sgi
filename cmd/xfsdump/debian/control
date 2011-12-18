@@ -1,0 +1,26 @@
+Source: xfsdump
+Section: admin
+Priority: optional
+Maintainer: Nathan Scott <nathans@debian.org>
+Build-Depends: uuid-dev, xfslibs-dev, attr-dev, autoconf, debmake
+Standards-Version: 3.1.1
+
+Package: xfsdump
+Depends: ${shlibs:Depends}, xfsprogs
+Architecture: any
+Description: Administrative utilities for the XFS filesystem
+ The xfsdump package contains xfsdump, xfsrestore and a number of
+ other administrative utilities for managing XFS filesystems.
+ .
+ xfsdump examines files in a filesystem, determines which need to be
+ backed up, and copies those files to a specified disk, tape or other
+ storage medium.  It uses XFS-specific directives for optimizing the
+ dump of an XFS filesystem, and also knows how to backup XFS extended
+ attributes.  Backups created with xfsdump are "endian safe" and can
+ thus be transfered between Linux machines of different architectures
+ and also between IRIX machines.
+ .
+ xfsrestore performs the inverse function of xfsdump; it can restore a
+ full backup of a filesystem.  Subsequent incremental backups can then
+ be layered on top of the full backup.  Single files and directory
+ subtrees may be restored from full or partial backups.

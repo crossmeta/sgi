@@ -1,0 +1,9 @@
+xfsdump (1.0.0) unstable; urgency=low
+
+  * Initial release.
+
+ -- Nathan Scott <nathans@debian.org>  Sat, 18 Nov 2000 09:27:47 -0500
+
+Local variables:
+mode: debian-changelog
+End:

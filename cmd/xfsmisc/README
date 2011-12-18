@@ -1,0 +1,23 @@
+Miscellaneous utilities for XFS
+-------------------------------
+
+mkinitrd.xfs
+	Russell's modified version of mkinitrd.  Notes from rlog:
+
+	Modified mkinitrd: make it large enough to fit xfs and pagebuf (15meg)
+	Use static version of bash rather than sash; sash doesn't seem to work.
+	(bash.static not supplied must build your own).
+	Note default ram disk size in the kernel is 4096k
+	add append="ramdisk_size=15000" to lilo.conf
+
+xfs_stats.pl
+	Perl script to massage the /proc/fs/xfs/stat file into a readable
+	format.  Use "perldoc xfs_stats.pl" to see the man page.  We dont
+	install this script in xfsprogs, for example, as we don't want to
+	introduce a prereq on perl just for this little script.
+
+kiobuf_io.patch
+	Patch (against the xfs tree at 2.4.3) to re-introduce the
+	kiobuf based I/O patch. This code was removed due to change
+	in direction in the community direction for the block I/O
+	layer.

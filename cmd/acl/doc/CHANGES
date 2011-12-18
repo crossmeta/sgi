@@ -1,0 +1,9 @@
+
+acl-1.0.1 (30 January 2001)
+        - minor rpm and deb packaging work
+
+acl-1.0.0 (15 January 2001)
+	- access control list code abstracted from xfs-cmds package
+	- completed Debian packaging
+	- late beta code
+

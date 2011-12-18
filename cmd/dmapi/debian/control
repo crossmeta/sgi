@@ -1,0 +1,27 @@
+Source: dmapi
+Section: admin
+Priority: optional
+Maintainer: Nathan Scott <nathans@debian.org>
+Build-Depends: autoconf, debmake, xfsprogs-dev
+Standards-Version: 3.1.1
+
+Package: dmapi
+Depends: ${shlibs:Depends}
+Architecture: any
+Description: Data Management API runtime environment
+ Files required by system software using the Data Management API
+ (DMAPI).  This is used to implement the interface defined in the
+ X/Open document:  Systems Management: Data Storage Management
+ (XDSM) API dated February 1997.  This interface is implemented
+ by the libdm library.
+
+Package: dmapi-dev
+Section: devel
+Priority: extra
+Depends: libc6-dev, dmapi, xfslibs-dev
+Architecture: any
+Description: Data Management API static libraries and headers
+ dmapi-dev contains the libraries and header files needed to
+ develop programs which make use of the Data Management API
+ (DMAPI).  You must install the xfslibs-dev package with
+ dmapi-dev.

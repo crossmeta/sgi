@@ -1,0 +1,109 @@
+#! /bin/sh
+# 
+#	Make whichever packages have been requested.
+#	Defaults to RPMs.
+#
+LOGDIR=Logs
+
+type=rpm
+verbose=false
+
+MAKE=${MAKE:-make}
+test ! -z "$MAKE" && make=$MAKE
+
+for opt in $*
+do
+	case "$opt" in
+	clean)
+		;; # ignored, kept for backward compatibility
+	rpm)
+		type=rpm ;;
+	debian)
+		type=debian ;;
+	verbose)
+		verbose=true ;;
+	*)
+		echo "Usage: Makepkgs [verbose] [debian|rpm]"; exit 1 ;;
+	esac
+done
+
+# start with a clean manifest
+test -f files.rpm && rm -f files.rpm
+test -f filesdevel.rpm && rm -f filesdevel.rpm
+
+test ! -d $LOGDIR && mkdir $LOGDIR
+rm -rf $LOGDIR/* > /dev/null 2>&1
+
+# build Debian packages, cleans itself before starting
+SUDO=${SUDO:-sudo}
+test ! -z "$SUDO" && sudo=$SUDO
+if [ $type = debian ] ; then
+	LOGDEB=`pwd`
+	LOGDEB=../`basename $LOGDEB`.log
+	echo "== Debian build, log is $LOGDEB"; echo
+	if $verbose ; then
+		dpkg-buildpackage -r$SUDO | tee $LOGDEB
+	else
+		dpkg-buildpackage -r$SUDO > $LOGDEB
+	fi
+	exit 0
+fi
+
+# build RPM packages - manual clean before starting
+echo "== clean, log is $LOGDIR/clean"
+if $verbose ; then
+	$MAKE clean 2>&1 | tee $LOGDIR/clean
+else
+	$MAKE clean > $LOGDIR/clean 2>&1 
+fi
+if [ $? -ne 0 ] ; then
+	echo \"$MAKE clean\" failed, see log in $LOGDIR/clean
+	tail $LOGDIR/clean
+	exit 1
+fi
+
+echo
+echo "== configure, log is $LOGDIR/configure"
+if $verbose ; then
+	autoconf 2>&1 | tee $LOGDIR/configure
+	./configure 2>&1 | tee -a $LOGDIR/configure
+else
+	autoconf > $LOGDIR/configure 2>&1 
+	./configure >> $LOGDIR/configure 2>&1 
+fi
+if [ $? -ne 0 ] ; then
+	echo \"configure\" failed, see log in $LOGDIR/configure
+	tail $LOGDIR/configure
+	exit 1
+fi
+
+echo
+echo "== default, log is $LOGDIR/default"
+if $verbose ; then
+	$MAKE default 2>&1 | tee $LOGDIR/default
+else
+	$MAKE default > $LOGDIR/default 2>&1 
+fi
+if [ $? -ne 0 ] ; then
+	echo \"$MAKE default\" failed, see log in $LOGDIR/default
+	tail $LOGDIR/default
+	exit 1
+fi
+
+echo
+echo "== dist, log is $LOGDIR/dist"
+[ ! -f .census ] && touch .census
+if $verbose ; then
+	$MAKE -C build dist 2>&1 | tee $LOGDIR/dist
+else
+	$MAKE -C build dist > $LOGDIR/dist 2>&1
+fi
+if [ $? -ne 0 ] ; then
+	echo $MAKE dist failed, see log in $LOGDIR/dist
+	tail $LOGDIR/dist
+	exit 1
+else
+	grep '^Wrote:' $LOGDIR/dist | sed -e 's/\.\.\/\.\.\///'
+fi
+
+exit 0

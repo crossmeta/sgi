@@ -1,0 +1,135 @@
+.TH xfs_growfs 8
+.SH NAME
+xfs_growfs, xfs_info \- expand an XFS filesystem
+.SH SYNOPSIS
+.nf
+\f3xfs_growfs\f1 [ \f3\-dilnrxV\f1 ] [ \f3\-D\f1 size ] [ \f3\-e\f1 rtextsize ]
+		[ \f3\-L\f1 size ] [ \f3\-m\f1 maxpct ] [ \f3-t\f1 mtab ]
+		[ \f3\-R\f1 size ] mount-point
+\f3xfs_info\f1 [ \f3-t\f1 mtab ] mount-point
+.fi
+.SH DESCRIPTION
+.I xfs_growfs
+expands an existing XFS filesystem (see
+.IR xfs (5)).
+The
+.I mount-point
+argument is the pathname of the directory where the filesystem
+is mounted.
+The filesystem must be mounted to be grown (see
+.IR mount (8)).
+The existing contents of the filesystem are undisturbed, and the added space
+becomes available for additional file storage.
+.PP
+.I xfs_info
+is equivalent to invoking
+.I xfs_growfs
+with the
+.B \-n
+option (see discussion below).
+.PP
+The options to
+.I xfs_growfs
+are:
+.TP
+\f3\-d\f1, \f3\-D\f1 \f2size\f1
+Specifies that the data section of the filesystem should be grown.
+If the
+.B \-D
+.I size
+option is given, the data section is grown to that size, otherwise
+the data section is grown to the largest size possible.
+The size
+is expressed in
+filesystem blocks.
+.TP
+.B \-e
+Allows the real-time extent size to be specified.
+In
+.IR mkfs.xfs (8)
+this is specified with
+.B \-r
+.BI extsize= nnnn.
+.TP
+.B \-i
+The new log is an internal log
+(inside the data section).
+.TP
+\f3\-l\f1, \f3\-L\f1 \f2size\f1
+Specifies that the log section of the filesystem should be grown,
+shrunk, or moved.
+If the
+.B \-L
+.I size
+option is given, the log section is changed to be that size,
+if possible.
+The size is expressed in
+filesystem blocks.
+The size of an internal log must be smaller than the size
+of an allocation group (this value is printed at \f2mkfs\f1(8) time).
+If neither
+.B \-i
+nor
+.B \-x
+is given with
+.BR \-l ,
+the log continues to be internal or external as it was before.
+.TP
+.B \-m
+Specify a new value for the maximum percentage
+of space in the filesystem that can be allocated as inodes.
+In
+.I mkfs.xfs
+this is specified with
+.B -i
+.BI maxpct= nn.
+.TP
+.B \-n
+Specifies that no change to the filesystem is to be made.
+The filesystem geometry is printed, and argument checking is performed,
+but no growth occurs.
+.TP
+\f3\-r\f1, \f3\-R\f1 \f2size\f1
+Specifies that the real-time section of the filesystem should be grown.
+If the
+.B \-R
+.I size
+option is given, the real-time section is grown to that size, otherwise
+the real-time section is grown to the largest size possible.
+The size
+is expressed in
+filesystem blocks.
+The filesystem does not need to have contained a real-time section before
+the \f2xfs_growfs\f1 operation.
+.TP
+.B \-t
+Specifies an alternate mount table file (default is
+.IR /etc/mtab ).
+This is used when working with filesystems mounted without writing to
+.I /etc/mtab
+file - refer to
+.BR mount (8)
+for further details.
+.TP
+.PP
+.I xfs_growfs
+is most often used in conjunction with
+logical volumes
+(see
+.IR lvm (8)
+).
+However, it can also be used on a regular disk partition, for example if a
+partition has been enlarged while retaining the same starting block.
+.SH PRACTICAL USE
+Filesystems normally occupy all of the space on the device where they
+reside.
+In order to grow a filesystem, it is necessary to provide added
+space for it to occupy.
+Therefore there must be at least one spare new
+disk partition available.
+Adding the space is done through the mechanism of
+logical volumes.
+.SH SEE ALSO
+mkfs.xfs(8),
+lvm(8),
+mount(8).

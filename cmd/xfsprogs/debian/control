@@ -1,0 +1,33 @@
+Source: xfsprogs
+Section: admin
+Priority: optional
+Maintainer: Nathan Scott <nathans@debian.org>
+Build-Depends: uuid-dev, autoconf, debmake
+Standards-Version: 3.1.1
+
+Package: xfsprogs
+Depends: ${shlibs:Depends}
+Architecture: any
+Description: Utilities for managing the XFS filesystem
+ A set of commands to use the XFS filesystem, including mkfs.xfs.
+ .
+ XFS is a high performance journaling filesystem which originated
+ on the SGI IRIX platform.  It is completely multi-threaded, can
+ support large files and large filesystems, extended attributes,
+ variable block sizes, is extent based, and makes extensive use of
+ Btrees (directories, extents, free space) to aid both performance
+ and scalability.
+ .
+ Refer to the documentation at http://oss.sgi.com/projects/xfs/
+ for complete details.  This implementation is on-disk compatible
+ with the IRIX version of XFS.
+
+Package: xfslibs-dev
+Section: devel
+Priority: extra
+Depends: libc6-dev, xfsprogs
+Architecture: any
+Description: XFS filesystem-specific static libraries and headers.
+ xfslibs-dev contains the libraries and header files needed to
+ develop XFS filesystem-specific programs.
+ 

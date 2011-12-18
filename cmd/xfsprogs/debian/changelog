@@ -1,0 +1,48 @@
+xfsprogs (1.2.0) unstable; urgency=low
+
+  * Support for group quota added
+  * Stripe unit/stripe width extraction for MD devices
+  * Added mkfs.xfs heuristics for size of internal log
+
+ -- Nathan Scott <nathans@debian.org>  Sun,  1 Apr 2001 16:49:26 +1000
+
+xfsprogs (1.1.6) unstable; urgency=low
+
+  * Fix sparc build failure - fcntl.h missing O_DIRECT (closes: #90211)
+  * Added README.quota describing the use of quota with XFS
+
+ -- Nathan Scott <nathans@debian.org>  Tue, 20 Mar 2001 11:25:03 +1100
+
+xfsprogs (1.1.5) unstable; urgency=low
+
+  * Upgraded LVM stripe unit/width support to 0.9beta2 (IOP 10)
+  * Kernel now supports O_DIRECT - re-enable its use in xfs_mkfile
+  * BLKSETSIZE ioctl replaced by BLKBSZSET ioctl in libxfs
+  * libxfs_init extended so only mkfs and xfs_repair use BLKBSZSET
+  * NOTE: this requires an XFS kernel from 9 March '01 or later
+
+ -- Nathan Scott <nathans@debian.org>  Sun, 18 Mar 2001 14:31:17 +1100
+
+xfsprogs (1.1.3) unstable; urgency=low
+
+  * Minor changes to xfs_logprint tail verification
+  * Update build Makefile to pick up extra dirt before packaging
+
+ -- Nathan Scott <nathans@debian.org>  Thu,  1 Mar 2001 12:24:28 +1100
+
+xfsprogs (1.1.2) unstable; urgency=low
+
+  * Fix stdarg.h issue causing build failure with glibc 2.2.2
+  * Changes to libhandle for supporting extended attributes
+
+ -- Nathan Scott <nathans@debian.org>  Tue, 20 Feb 2001 08:29:36 +1100
+
+xfsprogs (1.1.0) unstable; urgency=low
+
+  * Initial release (closes: #83829)
+
+ -- Nathan Scott <nathans@debian.org>  Thu,  4 Jan 2001 11:15:11 -0500
+
+Local variables:
+mode: debian-changelog
+End:

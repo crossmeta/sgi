@@ -1,0 +1,91 @@
+xfsprogs-1.2.0 (1 April 2001)
+	- support for group quota added
+	- some headers updated, in particular <xqm.h>
+	- now in late stages of beta
+
+xfsprogs-1.1.9 (26 March 2001)
+	- added automagic stripe unit/stripe width extraction for MD devices
+
+xfsprogs-1.1.8 (23 March 2001)
+	- mkfs heuristics to make a qualified guess of internal logsize
+
+xfsprogs-1.1.7 (20 March 2001)
+	- upgraded LVM to 0.9beta6
+	- minor rpm spec file changes
+
+xfsprogs-1.1.6 (20 March 2001)
+	- fix sparc build failure - fcntl.h missing O_DIRECT
+	- added README.quota describing use of quota with XFS
+
+xfsprogs-1.1.5 (12 March 2001)
+	- upgraded LVM support to 0.9beta2 (IOP 10)
+
+xfsprogs-1.1.4 (10 March 2001)
+	- kernel now supports O_DIRECT - re-enable its use in xfs_mkfile
+	- BLKSETSIZE ioctl replaced by BLKBSZSET ioctl in libxfs
+	- libxfs_init extended so only mkfs and xfs_repair use BLKBSZSET
+	- NOTE: this version requires an XFS kernel from March 9 or later
+
+xfsprogs-1.1.3 (02 March 2001)
+	- minor Makefile-related cleanups
+
+xfsprogs-1.1.2 (10 February 2001)
+	- added libhandle routines to simplify dump/restore EA support
+
+xfsprogs-1.1.1 (30 January 2001)
+	- minor rpm and deb packaging work
+
+xfsprogs-1.1.0 (15 January 2001)
+	- rework xfs-cmds package into base, devel and dump packages
+	- completed Debian packaging
+	- late beta code
+
+xfs-cmds-1.0.7 (02 January 2001)
+	- added mkfs support for extracting LVM stripe unit/width
+	- libattr (*experimental* extended attributes interface) added
+	- removed xfs_fstab.5 man page (merged into mount.8)
+	- install xfs_repair into /sbin, not /usr/sbin
+
+xfs-cmds-1.0.6 (04 October 2000)
+	- reworked external log format to be IRIX compatible
+	- mkfs, repair, db, logprint now work with new format
+	- xfs_admin added for setting filesystem label
+
+xfs-cmds-1.0.5 (18 September 2000)
+	- minor bug fixes
+	- first beta release
+
+xfs-cmds-1.0.4 (18 August 2000)
+	- minor bug fixes
+	- xfs_growfs added
+	- xfs_info added
+	- late alpha code
+
+xfs-cmds-1.0.3 (16 August 2000)
+	- numerous bug fixes
+	- xfsdump and xfsrestore added
+	- xfsstats added
+	- fsck.xfs (symlink to /bin/true) added
+	- demise of sim library complete, mkfs and repair reworked
+	- no longer need to have an XFS kernel handy for building xfs-cmds
+	- xfs_copy compiles on Linux
+	- dump/restore README added
+	- late alpha code
+
+xfs-cmds-1.0.2 (27 July 2000)
+	- numerous bug fixes
+	- xfs_attr (extended attributes) command added
+	- fsr_xfs added (ported by jones@tacc.utexas.edu)
+	- LVM+XFS README added
+	- early alpha code
+
+xfs-cmds-1.0.1 (5 July 2000)
+	- numerous bug fixes
+	- reworked build environment
+	- begun work on user/kernel separation
+	- early alpha code
+
+xfs-cmds-1.0.0 (16 June 2000)
+	- initial release for USENIX CDs
+	- early alpha code
+

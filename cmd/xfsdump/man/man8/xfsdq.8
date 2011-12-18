@@ -1,0 +1,116 @@
+.TH xfsdq 8
+.SH NAME
+xfsdq, xfsrq \- XFS dump and restore quota
+.SH SYNOPSIS
+.nf
+\f3xfsdq\f1 [ \f3\-g\f1|\f3-u\f1 ] filesystem
+\f3xfsrq\f1 [ \f3\-g\f1|\f3-u\f1 ] xfsdump_quotas
+.fi
+.SH DESCRIPTION
+.B xfsdq
+outputs a summary of the disk quotas for the specified XFS filesystem
+for either all users declared in the local
+.I /etc/passwd
+file, or all groups declared in the local
+.I /etc/group
+file.
+.PP
+The output format exactly matches that produced by the IRIX
+.I repquota
+command, given the
+.B \-e
+option.
+The format contains two lines for each user/group - the
+first line contains the filesystem device file, the second
+contains the uid/gid, block soft limit, block hard limit,
+inode soft limit, and finally the inode hard limit (in that
+order).
+.PP
+.B xfsdump
+runs
+.B xfsdq
+on those filesystems with quota enabled, and redirects the
+output (from standard output stream) to a file which is
+subsequently stored on the dump device.
+For user quota, this file is named
+.IR xfsdump_quotas ,
+for group quota it is named
+.IR xfsdump_quotas_group .
+Thus,
+the primary purpose of
+.B xfsdq
+is to maintain this dump file format between IRIX and Linux,
+such that
+.B xfsdump
+backups remain interchangable.
+.PP
+.B xfsrq
+is a simple wrapper around
+.BR setquota (8)
+which automates the restoration of quota information
+using this
+.I xfsdump_quotas
+file.
+.PP
+The
+.B \-u
+(user) option specifies user quota should be reported.
+This is the default.
+.PP
+The
+.B \-g
+(group) option specifies that group quota are to be reported.
+.PP
+The
+.I filesystem
+argument should be the filesystem mount point, and not the device.
+.SH RESTORE
+In order to restore quota information using the output from
+.BR xfsdq ,
+one must first restore a copy of the
+.I xfsdump_quotas
+file from the dump device.
+.PP
+On Linux, user quota can then be restored using:
+.PP
+.nf
+        # xfsrq -u xfsdump_quotas
+.fi
+.PP
+On IRIX, the equivalent command is:
+.PP
+.nf
+        # edquota -i xfsdump_quotas
+.fi
+.SH NOTES
+Only user quota are supported by both Linux and IRIX.
+Group quota are not supported on IRIX and project quota
+are not supported on Linux.
+.PP
+The soft and hard block limits reported by
+.B xfsdq
+are in units of 512 bytes for compatibility with IRIX.
+The Linux quota utilities, e.g.
+.BR quota (1)
+and
+.BR repquota (8),
+report blocks in units of 1024 bytes -
+.B xfsrq
+performs the necessary conversions automatically.
+.SH FILES
+.PD 0
+.TP 20
+.B /etc/mtab
+default filesystems
+.TP
+.B /etc/passwd
+default set of users
+.TP
+.B /etc/passwd
+default set of groups
+.SH SEE ALSO
+quota(1),
+repquota(8),
+setquota(8),
+xfsdump(8),
+xfs(5).

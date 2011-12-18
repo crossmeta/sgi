@@ -1,0 +1,350 @@
+.TH ATTRCTL 2
+.SH NAME
+attrctl \- manipulate (extended) attributes of system objects
+.SH C SYNOPSIS
+.PP
+.sp
+.nf
+.B #include <attr/attributes.h>
+.sp
+.B "int attrctl (attr_obj_t obj, int type, attr_op_t *ops,"
+.B "             int count);"
+.Op
+.SH OVERVIEW
+The
+.I attrctl
+system call allows a user to attach name/value pairs to system
+objects - typically filesystem objects (inodes).
+.P
+This is a first draft proposal which may well *not* be the final
+interface - it has been implemented to address some immediate
+issues with the current XFS implementation and is the first attempt
+at an interface which could allow both XFS and EXT2 extended attributes
+implementations to coexist.
+.P
+Extended attributes can be used to store meta-information about a
+file, for example "character-set=kanji" could tell a document browser
+to use the Kanji character set when displaying that document
+and "thumbnail=..." could provide a reduced resolution overview of a
+high resolution graphic image.
+.P
+The
+.B names
+can be up to MAXNAMELEN bytes in length, terminated by the first \e0 byte.
+The intent is that they be printable ASCII (or other character set)
+names for the attribute.
+.P
+The
+.B values
+can be up to ATTR_MAX_VALUELEN (currently 64KB) of arbitrary binary data.
+.P
+Attributes can be attached to all types of inodes:
+regular files, directories, symbolic links, device nodes, etc.
+.P
+There are 2 disjoint attribute name spaces associated with every
+filesystem object.
+They are the
+.B root
+and
+.B user
+address spaces.
+The
+.B root
+address space is accessible only to the super-user,
+and then only by specifying a flag to the operation request.
+Non-root users will not see or be able to modify attributes in the
+.B root
+address space.
+The
+.B user
+address space is protected by the normal file permissions mechanism,
+so the owner of the file can decide who is able to see and/or modify
+the value of attributes on any particular file.  The attribute get/list
+operations require read permission, and attribute set/remove require
+write permission.
+.P
+Attributes are currently supported only in the XFS and EXT2 filesystem
+types.  However, this system call has been designed to be generic
+and extensible, such that other filesystems should be able to make
+use of it.
+.SH DESCRIPTION
+The
+.I attrctl
+system call provides a way to access arbitrary extended attributes.
+.P
+.I Obj\^
+indicates the system object whose extended attributes are to be
+manipulated.
+The contents of the \f4attr_obj_t\f1 union are as follows:
+.P
+typedef union {
+.RS 3
+.nf
+.ft 4
+.ta 9n 22n
+char  *path;
+int   fd;
+pid_t pid;
+.ft 1
+.fi
+.RE
+} attr_obj_t;
+.PP
+.I type\^
+identifies the type of
+.I obj\^
+- currently only file descriptors and path names are implemented
+(ATTR_TYPE_NAME and ATTR_TYPE_FD), but processes have also been
+proposed (ATTR_TYPE_PID).
+.P
+.I Ops\^
+refers to an array of one or more input/output structures containing
+control information related to attribute operations and those
+operations' results.
+.PP
+The
+.I count
+argument indicates the number of structures in the
+.I ops
+array.
+.PP
+.Op c p a
+The contents of an \f4attr_op_t\fP structure are as follows:
+.P
+typedef struct {
+.RS 3
+.nf
+.ft 4
+.ta 9n 22n
+int  opcode; /* which operation to perform (see below) */
+int  error;  /* [out arg] result of this sub-op (an errno) */
+char *name;  /* attribute name to work with */
+char *value; /* [in/out arg] attribute value (raw bytes) */
+int  length; /* [in/out arg] length of value */
+int  flags;  /* flags (bit-wise OR of #defines below) */
+void *aux;   /* optional command-specific data */
+.ft 1
+.fi
+.RE
+} attr_op_t;
+.PP
+The
+.I opcode
+field defines how the remaining fields are to be interpreted
+and can take on one of the following
+.B ATTR_OP
+values.
+.PP
+.B ATTR_OP_GET
+returns the
+.I value
+associated with attribute
+.IR name .
+The size of the user buffer is passed in as
+.IR length ,
+and the size of the attribute value is returned in the same field.
+Valid flags are ATTR_ROOT and ATTR_DONTFOLLOW.
+.P
+.B ATTR_OP_SET
+sets (possibly creating a new attribute) the value of the
+attribute specified by
+.I name
+to
+.IR value .
+The
+.I length
+parameter specifies the size of the new value, and the valid
+.I flags
+are ATTR_ROOT, ATTR_DONTFOLLOW, ATTR_CREATE, and ATTR_REPLACE.
+.P
+.B ATTR_OP_REMOVE
+provides a way to remove previously created attributes.
+If the attribute
+.I name
+exists, the attribute name and its associated value will be
+removed.
+Valid
+.I flags 
+are ATTR_ROOT and ATTR_DONTFOLLOW.
+.P
+.B ATTR_OP_LIST  
+is used to list the existing attributes associated with an object.
+The
+.I name
+field is ignored \-
+.I value
+and
+.I size
+specify the buffer to be filled with at least a portion of the
+attributes associated with the given object.
+An
+.B attrlist_t
+structure will be written into the
+.I value
+buffer, containing a list of the attributes associated with the
+object, up to a maximum of
+.I size
+bytes.
+The
+.B attrlist_t
+structure contains the following elements:
+.P
+typedef struct {
+.RS 3
+.nf
+.ft 4
+.ta 9n 22n
+__s32 count;     /* number of entries in attribute list */
+__s32 more;      /* [in/out arg] more attrs (call again) */
+__s32 offset[1]; /* byte offsets of attrs [var-sized] */
+.ft 1
+.fi
+.RE
+} attrlist_t;
+.PP
+The
+.I count
+field shows the number of attributes represented in this buffer,
+which is also the number of elements in the
+.I offset
+array.
+The
+.I more
+field will be non-zero if another
+.B ATTR_OP_LIST
+call would retrieve more attributes.
+The
+.I offset
+array contains the byte offset within the
+.I value
+buffer of the structure describing each of the attributes, an
+.B attrlist_ent_t
+structure.
+The
+.B "ATTR_ENTRY(buffer, index)"
+macro will help with decoding the list.
+It takes a pointer to the
+.I value
+and an index into the
+.I offset
+array, and returns a pointer to the corresponding
+.I attrlist_ent_t
+structure.
+.P
+typedef struct {
+.RS 3
+.nf
+.ft 4
+.ta 9n 22n
+__u32 valuelen; /* number of bytes in attribute value */
+char  name[];   /* attribute name (NULL terminated) */
+.ft 1
+.fi
+.RE
+} attrlist_ent_t;
+.PP
+The
+.I valuelen
+field shows the size in bytes of the value associated
+with the attribute whose name is stored in the
+.I name
+field.
+.P
+Valid
+.I flags
+for the
+.B ATTR_LIST
+command are ATTR_ROOT and ATTR_DONTFOLLOW.
+The
+.I aux
+pointer is used to reference an opaque cursor (type
+.BR attrlist_cursor_t ),
+which the kernel uses to track the calling process's position
+in the attribute list.
+The only valid operations on this cursor are to pass it into the
+operation or to zero it out (it should be zeroed before the
+first
+.B attrctl
+call.
+Note that multi-threaded applications may keep more than one
+cursor in order to serve multiple contexts (i.e. the
+.B ATTR_LIST
+operation is "thread-safe").
+.P
+All operations will set
+.I error
+to an error code if the operation fails, otherwise it will
+contain zero indicating success.  The set of valid
+.I flags
+field values (combined using bitwise OR) is as follows:
+.TP
+.SM
+\%ATTR_ROOT
+Look for attribute
+.I name
+in the
+.B root
+address space, not in the
+.B user
+address space (limited to use by the super-user only).
+.TP
+.SM
+\%ATTR_DONTFOLLOW
+Do not follow symbolic links when resolving a
+.I path
+on an
+.I attr_set
+function call.
+The default is to follow symbolic links.
+.TP
+.SM
+\%ATTR_CREATE
+Set
+.I error
+field (EEXIST) if an attribute of the given name already
+exists on the indicated object.
+This flag is used to implement a pure create operation,
+without this flag
+.B ATTR_SET
+will create the attribute if it does not already exist.
+.TP
+.SM
+\%ATTR_REPLACE
+Set
+.I error
+field (ENOENT) if an attribute of the given name
+does not already exist on the indicated object,
+otherwise replace the existing attribute\'s value with the
+given value.
+This flag is used to implement a pure replacement operation,
+without this flag
+.B ATTR_SET
+will create the attribute if it does not already exist.
+.PP
+The
+.I error
+field will be set (EINVAL) if both ATTR_CREATE and ATTR_REPLACE
+are requested in the same operation.
+.SH DIAGNOSTICS
+.I attrctl
+will return 0 on success, and an error code on any failure.
+Since the
+.I attrctl
+system call is arbitrarily extensible, and the intention is that it
+will always be used through an overlying API, refer to the manual
+pages for overlying API calls for specific error code values.
+.P
+.I attrctl
+will always attempt to perform all operations, and a set of
+operations are not atomic (failure of one operation does not
+necessarily cause prior successful operations to be undone).
+.SH "SEE ALSO"
+attr(1),
+.br
+attr_list(3), attr_listf(3),
+.br
+attr_multi(3), attr_multif(3),
+.br
+attr_remove(3), attr_removef(3),
+.br
+attr_set(3), attr_setf(3).

@@ -1,0 +1,24 @@
+Source: attr
+Section: admin
+Priority: optional
+Maintainer: Nathan Scott <nathans@debian.org>
+Build-Depends: autoconf, debmake
+Standards-Version: 3.1.1
+
+Package: attr
+Depends: ${shlibs:Depends}
+Architecture: any
+Description: Experimental utility for manipulating extended attributes
+ An *experimental* command to manipulate filesystem extended
+ attributes.  Currently, only the XFS filesystem is supported.
+
+Package: attr-dev
+Section: devel
+Priority: extra
+Depends: libc6-dev, attr
+Architecture: any
+Description: Extended attribute static libraries and headers.
+ attr-dev contains the libraries and header files needed to
+ develop programs which make use of extended attributes.
+ This is an *experimental* interface, currently only XFS is
+ supported, and the interface is likely to change.

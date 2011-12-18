@@ -1,0 +1,24 @@
+Source: acl
+Section: admin
+Priority: optional
+Maintainer: Nathan Scott <nathans@debian.org>
+Build-Depends: autoconf, debmake
+Standards-Version: 3.1.1
+
+Package: acl
+Depends: ${shlibs:Depends}
+Architecture: any
+Description: Experimental chacl utility for manipulating POSIX ACLs
+ An *experimental* command (chacl) to manipulate access control
+ lists according to the (draft) POSIX 1003 standard.
+
+Package: acl-dev
+Section: devel
+Priority: extra
+Depends: libc6-dev, acl
+Architecture: any
+Description: POSIX ACL static libraries and headers
+ acl-dev contains the libraries and header files needed to
+ develop programs which make use of access control lists.
+ This is an *experimental* interface, currently only XFS is
+ supported, and the interface may change.

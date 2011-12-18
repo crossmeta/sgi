@@ -1,0 +1,48 @@
+#!/usr/bin/make -f
+
+package=xfsdump
+
+dirtmp = debian/tmp
+pkgtmp = DIST_ROOT=`pwd`/$(dirtmp); export DIST_ROOT;
+stdenv = GZIP=-q; export GZIP;
+options = DEBUG="-DNDEBUG"; OPTIMIZER="-O1 -g"; DISTRIBUTION="debian"; \
+	export DEBUG OPTIMIZER DISTRIBUTION;
+checkdir = test -f debian/rules
+
+build: built
+built:
+	@echo "== dpkg-buildpackage: build" 1>&2
+	$(checkdir)
+	autoconf
+	$(options) ./configure
+	$(MAKE) default
+	touch built
+
+clean:
+	@echo "== dpkg-buildpackage: clean" 1>&2
+	$(checkdir)
+	-rm -f built
+	$(MAKE) distclean
+	-rm -rf $(dirtmp) debian/*substvars debian/files*
+
+binary-indep:
+
+binary-arch: checkroot built
+	@echo "== dpkg-buildpackage: binary-arch" 1>&2
+	$(checkdir)
+	-rm -rf $(dirtmp) $(dirdev)
+	$(pkgtmp) $(MAKE) -C . install
+	$(pkgtmp) $(MAKE) -C build src-manifest
+	@echo "== dpkg-buildpackage: debstd" 1>&2
+	$(stdenv) debstd -m
+	dpkg-gencontrol -isp -p$(package)
+	chown -R root.root $(dirtmp)
+	chmod -R go=rX $(dirtmp)
+	dpkg --build $(dirtmp) ..
+
+binary: binary-indep binary-arch
+
+checkroot:
+	test 0 -eq `id -u`
+
+.PHONY: binary binary-arch binary-indep clean checkroot

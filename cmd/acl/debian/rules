@@ -1,0 +1,61 @@
+#!/usr/bin/make -f
+
+package = acl
+develop = $(package)-dev
+
+dirtmp = debian/tmp
+dirdev = debian/$(develop)
+doctmp = /usr/share/doc/$(package)
+docdev = /usr/share/doc/$(develop)
+pkgtmp = DIST_ROOT=`pwd`/$(dirtmp); export DIST_ROOT;
+pkgdev = DIST_ROOT=`pwd`/$(dirdev); export DIST_ROOT;
+stdenv = GZIP=-q; export GZIP;
+
+options = DEBUG="-DNDEBUG"; OPTIMIZER="-O1 -g"; DISTRIBUTION="debian"; \
+	export DEBUG OPTIMIZER DISTRIBUTION;
+checkdir = test -f debian/rules
+
+build: built
+built:
+	@echo "== dpkg-buildpackage: build" 1>&2
+	$(checkdir)
+	autoconf
+	$(options) ./configure
+	$(MAKE) default
+	touch built
+
+clean:
+	@echo "== dpkg-buildpackage: clean" 1>&2
+	$(checkdir)
+	-rm -f built
+	$(MAKE) distclean
+	-rm -rf $(dirtmp) $(dirdev) debian/*substvars debian/files*
+
+binary-indep:
+
+binary-arch: checkroot built
+	@echo "== dpkg-buildpackage: binary-arch" 1>&2
+	$(checkdir)
+	-rm -rf $(dirtmp) $(dirdev)
+	$(pkgtmp) $(MAKE) -C . install
+	$(pkgdev) $(MAKE) -C . install-dev
+	$(pkgtmp) $(MAKE) -C build src-manifest
+	$(pkgdev) ./install-sh -m 755 -d $(doctmp)
+	$(pkgdev) ./install-sh -m 755 -d $(docdev)
+	$(pkgdev) ./install-sh -m 644 debian/copyright $(docdev)
+	$(pkgdev) ./install-sh -m 644 debian/changelog $(docdev)
+	@echo "== dpkg-buildpackage: debstd" 1>&2
+	$(stdenv) debstd -m
+	dpkg-gencontrol -isp -p$(package) -P$(dirtmp)
+	dpkg-gencontrol -isp -p$(develop) -P$(dirdev)
+	chown -R root.root $(dirtmp) $(dirdev)
+	chmod -R go=rX $(dirtmp) $(dirdev)
+	dpkg --build $(dirtmp) .. 
+	dpkg --build $(dirdev) ..
+
+binary: binary-indep binary-arch
+
+checkroot:
+	test 0 -eq `id -u`
+
+.PHONY: binary binary-arch binary-indep clean checkroot

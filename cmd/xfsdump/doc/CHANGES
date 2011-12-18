@@ -1,0 +1,33 @@
+
+xfsdump-1.0.7 (07 May 2001)
+	- fix warnings, remove last -Wall filter
+	- configure script default man path now /usr/share/man
+	- support realtime files in dump/restore
+	- cleanup arch-specific code, esp. the byteswab routines
+	- as a result, move to -O1 as default for extern inlines
+
+xfsdump-1.0.6 (01 May 2001)
+	- remove spurious warnings when dumping quota information
+
+xfsdump-1.0.5 (09 April 2001)
+	- fix use of an uninitialised variable in dump
+	- fix a number of compiler warnings
+
+xfsdump-1.0.4 (03 April 2001)
+	- added xfsdump support for dumping quota information
+
+xfsdump-1.0.3 (28 March 2001)
+	- minor rpm spec file changes
+	- added xfsdq and xfsrq for dumping quota information
+
+xfsdump-1.0.2 (10 January 2001)
+        - support extended attributes in xfsdump and xfsrestore
+
+xfsdump-1.0.1 (30 January 2001)
+        - minor rpm and deb packaging work
+
+xfsdump-1.0.0 (15 January 2001)
+	- dump, restore, fsr and co. abstracted from xfs-cmds package
+        - completed Debian packaging
+        - late beta code
+

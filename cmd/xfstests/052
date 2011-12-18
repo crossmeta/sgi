@@ -1,0 +1,135 @@
+#! /bin/sh
+# XFS QA Test No. 052
+# $Id: 1.1 $
+#
+# Ensure that quota(1) displays blocksizes matching ondisk dquots.
+#
+# MOUNT_OPTIONS can be set to grpquota to test group quota,
+# defaults to usrquota if MOUNT_OPTIONS is not set.
+#
+#-----------------------------------------------------------------------
+# Copyright (c) 2000 Silicon Graphics, Inc.  All Rights Reserved.
+# 
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of version 2 of the GNU General Public License as
+# published by the Free Software Foundation.
+# 
+# This program is distributed in the hope that it would be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# 
+# Further, this software is distributed without any warranty that it is
+# free of the rightful claim of any third person regarding infringement
+# or the like.  Any license provided herein, whether implied or
+# otherwise, applies only to this software file.  Patent licenses, if
+# any, provided herein do not apply to combinations of this program with
+# other software, or any other product whatsoever.
+# 
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write the Free Software Foundation, Inc., 59
+# Temple Place - Suite 330, Boston MA 02111-1307, USA.
+# 
+# Contact information: Silicon Graphics, Inc., 1600 Amphitheatre Pkwy,
+# Mountain View, CA  94043, or:
+# 
+# http://www.sgi.com 
+# 
+# For further information regarding this notice, see: 
+# 
+# http://oss.sgi.com/projects/GenInfo/SGIGPLNoticeExplan/
+#-----------------------------------------------------------------------
+#
+# creator
+owner=nathans@sgi.com
+
+seq=`basename $0`
+echo "QA output created by $seq"
+
+here=`pwd`
+tmp=/tmp/$$
+status=1	# failure is the default!
+
+# get standard environment, filters and checks
+. ./common.rc
+. ./common.filter
+. ./common.quota
+
+_cleanup()
+{
+	umount $SCRATCH_MNT 2>/dev/null
+	rm -f $tmp.*
+}
+trap "_cleanup; exit \$status" 0 1 2 3 15
+rm -f $seq.full $seq.out
+
+_require_scratch
+_require_quota
+
+# setup a default run
+if [ -z "$MOUNT_OPTIONS" ]; then
+        MOUNT_OPTIONS="-o usrquota"; export MOUNT_OPTIONS
+fi
+
+# real QA test starts here
+mkfs -t xfs -f $SCRATCH_DEV | _filter_mkfs 2>$tmp.mkfs
+cat $tmp.mkfs >>$seq.full
+chmod a+w $seq.full     # arbitrary users will write here
+
+# keep the blocksize from mkfs ($dbsize)
+. $tmp.mkfs
+
+_qmount
+
+# setup user/group to test
+if src/feature -U $SCRATCH_DEV ; then
+	type=u ; id=`_choose_uid`
+elif src/feature -G $SCRATCH_DEV ; then
+	type=g ; id=`_choose_gid`
+else
+	_notrun "No quota support at mount time"
+fi
+
+# create 100 (fs-blocksize) blocks
+_file_as_id $SCRATCH_MNT/foo $id $type $dbsize 220
+sync
+
+# set limit at 1001 (1k) blocks
+setquota -n -$type $id $SCRATCH_DEV 1001 1001 10 10
+
+# cross check blks, softblks, hardblks <-> quota, xfs_db
+quota $type -n $id | tee -a $seq.full | perl -ne '
+	if (m,^\s*'$SCRATCH_DEV'\s+(\d+)\s+(\d+)\s+(\d+),) {
+		print "used_blocks=", $1, "\n";
+		print "soft_blocks=", $2, "\n";
+		print "hard_blocks=", $3, "\n";
+	}' | LC_COLLATE=POSIX sort >$tmp.quota
+
+echo ===quota output >> $seq.full
+cat $tmp.quota >> $seq.full
+[ ! -s $tmp.quota ] && echo "warning: quota output file is empty"
+
+umount $SCRATCH_MNT
+
+# note - does (insitu) conversion from fs blocks to 1K blocks
+xfs_db -rc "dquot -$type $id" -c p $SCRATCH_DEV | tee -a $seq.full | perl -ne '
+	if (/^diskdq.bcount = (\d+)$/) {
+		 print "used_blocks=", $1 * '$dbsize' / 1024, "\n";
+	}
+	elsif (/^diskdq.blk_hardlimit = (\d+)$/) {
+		 print "hard_blocks=", $1 * '$dbsize' / 1024, "\n";
+	}
+	elsif (/^diskdq.blk_softlimit = (\d+)$/) {
+		print "soft_blocks=", $1 * '$dbsize' / 1024, "\n";
+	}' | LC_COLLATE=POSIX sort >$tmp.xfs_db
+
+echo ===xfs_db output >> $seq.full
+cat $tmp.xfs_db >> $seq.full
+[ ! -s $tmp.xfs_db ] && echo "warning: xfs_db output file is empty"
+
+echo Comparing out of quota and xfs_db
+diff $tmp.quota $tmp.xfs_db 
+[ $? -eq 0 ] && echo OK.
+
+# success, all done
+status=0
+exit

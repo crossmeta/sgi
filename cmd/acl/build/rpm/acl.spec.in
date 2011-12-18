@@ -1,0 +1,86 @@
+Summary: Command for manipulating access control lists
+Name: @pkg_name@
+Version: @pkg_version@
+Release: @pkg_release@
+Distribution: @pkg_distribution@
+Packager: @pkg_builder@
+BuildRoot: @build_root@ 
+Prereq: /sbin/ldconfig
+Source: @pkg_name@-@pkg_version@.src.tar.gz
+Copyright: Copyright (C) 2000 Silicon Graphics, Inc.
+Vendor: Silicon Graphics, Inc.
+URL: http://oss.sgi.com/projects/xfs/
+Group: System Environment/Base
+
+%description
+A command (chacl) to manipulate POSIX access control lists
+under Linux.
+
+%package devel
+Summary: Access control list static libraries and headers.
+Group: Development/Libraries
+Requires: @pkg_name@
+
+%description devel
+acl-devel contains the libraries and header files needed to
+develop programs which make use of POSIX access control lists.
+
+You should install acl-devel if you want to develop programs
+which make use of ACLs.  If you install acl-devel, you'll
+also want to install acl.
+
+# If .census exists, then no setup is necessary, just go and do the build,
+# otherwise run setup
+%prep
+if [ -f .census ] ; then
+   if [ ! -d ${RPM_PACKAGE_NAME}-${RPM_PACKAGE_VERSION} ] ; then
+      ln -s . ${RPM_PACKAGE_NAME}-${RPM_PACKAGE_VERSION}
+   fi
+else
+%setup
+touch .census
+./configure
+fi
+
+%build
+@make@
+
+%install
+DIST_ROOT="$RPM_BUILD_ROOT"
+DIST_INSTALL=`pwd`/install.manifest
+DIST_INSTALL_DEV=`pwd`/install-dev.manifest
+export DIST_ROOT DIST_INSTALL DIST_INSTALL_DEV
+@make@ install DIST_MANIFEST="$DIST_INSTALL"
+@make@ install-dev DIST_MANIFEST="$DIST_INSTALL_DEV"
+files()
+{
+	sort | uniq | awk ' 
+$1 == "d" { printf ("%%%%dir %%%%attr(%s,%s,%s) %s\n", $2, $3, $4, $5); } 
+$1 == "f" { if (match ($6, "@pkg_man_dir@") || match ($6, "@pkg_doc_dir@"))
+		printf ("%%%%doc ");
+	    if (match ($6, "@pkg_man_dir@"))
+		printf ("%%%%attr(%s,%s,%s) %s*\n", $2, $3, $4, $6);
+	    else
+		printf ("%%%%attr(%s,%s,%s) %s\n", $2, $3, $4, $6); }
+$1 == "l" { if (match ($3, "@pkg_man_dir@") || match ($3, "@pkg_doc_dir@"))
+		printf ("%%%%doc ");
+	    if (match ($3, "@pkg_man_dir@"))
+		printf ("%attr(0777,root,root) %s*\n", $3);
+	    else
+		printf ("%attr(0777,root,root) %s\n", $3); }'
+}
+set +x
+files < "$DIST_INSTALL" > files.rpm
+files < "$DIST_INSTALL_DEV" > filesdevel.rpm
+set -x
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%post -p /sbin/ldconfig
+
+%postun -p /sbin/ldconfig
+
+%files -f files.rpm
+
+%files devel -f filesdevel.rpm

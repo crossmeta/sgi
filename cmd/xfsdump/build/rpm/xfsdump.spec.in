@@ -1,0 +1,77 @@
+Summary: Administrative utilities for the XFS filesystem.
+Name: @pkg_name@
+Version: @pkg_version@
+Release: @pkg_release@
+Distribution: @pkg_distribution@
+Packager: @pkg_builder@
+BuildRoot: @build_root@ 
+Requires: xfsprogs
+Source: @pkg_name@-@pkg_version@.src.tar.gz
+Copyright: Copyright (C) 2000 Silicon Graphics, Inc.
+Vendor: Silicon Graphics, Inc.
+URL: http://oss.sgi.com/projects/xfs/
+Group: Applications/Archiving
+
+%description
+The xfsdump package contains xfsdump, xfsrestore and a number of
+other utilities for administering XFS filesystems.
+
+xfsdump examines files in a filesystem, determines which need to be
+backed up, and copies those files to a specified disk, tape or other
+storage medium.  It uses XFS-specific directives for optimizing the
+dump of an XFS filesystem, and also knows how to backup XFS extended
+attributes.  Backups created with xfsdump are "endian safe" and can
+thus be transfered between Linux machines of different architectures
+and also between IRIX machines.
+
+xfsrestore performs the inverse function of xfsdump; it can restore a
+full backup of a filesystem.  Subsequent incremental backups can then
+be layered on top of the full backup.  Single files and directory
+subtrees may be restored from full or partial backups.
+
+# If .census exists, then no setup is necessary, just go and do the build,
+# otherwise run setup
+%prep
+if [ -f .census ] ; then
+   if [ ! -d ${RPM_PACKAGE_NAME}-${RPM_PACKAGE_VERSION} ] ; then
+      ln -s . ${RPM_PACKAGE_NAME}-${RPM_PACKAGE_VERSION}
+   fi
+else
+%setup
+touch .census
+./configure
+fi
+
+%build
+@make@
+
+%install
+DIST_ROOT="$RPM_BUILD_ROOT"
+DIST_INSTALL=`pwd`/install.manifest
+export DIST_ROOT DIST_INSTALL
+@make@ install DIST_MANIFEST="$DIST_INSTALL"
+files()
+{
+	sort | uniq | awk ' 
+$1 == "d" { printf ("%%%%dir %%%%attr(%s,%s,%s) %s\n", $2, $3, $4, $5); } 
+$1 == "f" { if (match ($6, "@pkg_man_dir@") || match ($6, "@pkg_doc_dir@"))
+		printf ("%%%%doc ");
+	    if (match ($6, "@pkg_man_dir@"))
+		printf ("%%%%attr(%s,%s,%s) %s*\n", $2, $3, $4, $6);
+	    else
+		printf ("%%%%attr(%s,%s,%s) %s\n", $2, $3, $4, $6); }
+$1 == "l" { if (match ($3, "@pkg_man_dir@") || match ($3, "@pkg_doc_dir@"))
+		printf ("%%%%doc ");
+	    if (match ($3, "@pkg_man_dir@"))
+		printf ("%attr(0777,root,root) %s*\n", $3);
+	    else
+		printf ("%attr(0777,root,root) %s\n", $3); }'
+}
+set +x
+files < "$DIST_INSTALL" > files.rpm
+set -x
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
+%files -f files.rpm

@@ -1,0 +1,23 @@
+.TH fsck.xfs 8
+.SH NAME
+fsck.xfs \- do nothing, successfully
+.SH SYNOPSIS
+.nf
+\f3fsck.xfs\f1 [ \f3...\f1]
+.fi
+.SH DESCRIPTION
+.I fsck.xfs
+is called by the generic Linux
+.IR fsck (8)
+program at startup to check and repair an XFS filesystem.
+XFS is a journaling filesystem and performs recovery at
+.IR mount (8)
+time if necessary, so
+.I fsck.xfs
+simply exits with a zero exit status.
+.SH FILES
+.IR /etc/fstab .
+.SH SEE ALSO
+fsck(8),
+fstab(5),
+xfs(5).

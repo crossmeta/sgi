@@ -1,0 +1,77 @@
+XFS on LVM
+__________
+
+PREFACE
+
+This is a quick reference to setting XFS up on LVM. For more information
+please see the LVM HOWTO at:
+
+                http://www.linuxdoc.org/HOWTO/LVM-HOWTO.html
+
+PREREQUISITES
+
+You need a kernel with LVM support either built in or as a module.
+This document assumes lvm as a module.
+
+SETTING UP LVM
+
+>>> Load module
+
+      [root@crash /sbin]# modprobe lvm-mod
+
+>>> Set partition type to 0x8e for partitions you wish to use with LVM
+
+      [root@crash /sbin]# fdisk /dev/sda1
+      Command (m for help): t
+      Partition number (1-4): 1
+      Hex code (type L to list codes): 8e
+      Changed system type of partition 1 to 8e (Unknown)
+
+      Command (m for help): w
+      The partition table has been altered!
+
+>>> Write PV superblock on physical volumes
+
+      [root@crash /root]# pvcreate /dev/sda1 /dev/sdb1 /dev/sdc1 /dev/sdd1
+      pvcreate -- physical volume "/dev/sda1" successfully created
+      pvcreate -- physical volume "/dev/sdb1" successfully created
+      pvcreate -- physical volume "/dev/sdc1" successfully created
+      pvcreate -- physical volume "/dev/sdd1" successfully created
+
+>>> Create a volume group consisting of the PVs we just set up
+
+[root@crash /root]# vgcreate vg00 /dev/sda1 /dev/sdb1 /dev/sdc1 /dev/sdd1
+      vgcreate -- INFO: using default physical extent size 4 MB
+      vgcreate -- INFO: maximum logical volume size is 255.99 Gigabyte
+      vgcreate -- doing automatic backup of volume group "vg00"
+      vgcreate -- volume group "vg00" successfully created and activated
+
+>>> Create a logical volume - striped across 4 PVs, 64 KB chunk size, 20 GB
+
+[root@crash /root]# lvcreate -i 4 -I 64 -L 20G -n lv00 vg00
+      lvcreate -- rounding 20971520 KB to stripe boundary size 20975616 KB / 5121 PE
+      lvcreate -- doing automatic backup of "vg00"
+      lvcreate -- logical volume "/dev/vg00/lv00" successfully created
+
+>>> Build a filesystem on the LV
+
+[root@crash /root]# mkfs -t xfs /dev/vg00/lv00 
+      meta-data=/dev/vg00/lv00         isize=256    agcount=20, agsize=262144 blks
+      data     =                       bsize=4096   blocks=5242879, imaxpct=25
+               =                       sunit=0      swidth=0 blks, unwritten=1
+      naming   =version 2              bsize=4096  
+      log      =internal log           bsize=4096   blocks=1200
+      realtime =none                   extsz=65536  blocks=0, rtextents=0
+
+[root@crash /root]# mount -t xfs /dev/vg00/lv00 /xfs
+
+>>> Go nuts
+
+
+After a reboot you will need to reactivate the VGs/LVs:
+
+      modprobe lvm-mod
+      vgchange -a y
+
+These commands could be added to a startup script.
+

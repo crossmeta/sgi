@@ -1,0 +1,298 @@
+QUOTA on XFS
+____________
+
+PREFACE
+
+For an additional source of information on Linux quota, you can refer to
+the (currently out-of-date) Linux Quota HOWTO at:
+
+            http://www.linuxdoc.org/HOWTO/mini/Quota.html
+
+If you are looking to get started quickly, you can skip down to the 
+section GETTING STARTED below.  It is recommended that you at least
+read the "Administering the XFS Quota System" section below, however.
+
+
+DESCRIPTION
+
+In most computing environments, disk space is not infinite.  The quota
+subsystem provides a mechanism to control usage of disk space.  Quotas
+can be set for each individual user on any/all of the local filesystems.
+The quotas subsystem warns users when they exceed their allotted limit,
+but allows some extra space for current work (hard limit/soft limit).
+In addition, XFS filesystems with limit enforcement turned off can be
+used as an effective disk usage accounting system.
+
+   Users' Views of Disk Quotas
+     To most users, disk quotas are either of no concern or a fact of life
+     that cannot be avoided.  There are two possible quotas that can be
+     imposed - a limit can be set on the amount of space a user can occupy,
+     and there may be a limit on the number of files (inodes) he can own.
+
+     The quota(1) command provides information on the quotas that have been
+     set by the system administrators and current usage.
+
+     There are four numbers for each limit:  current usage, soft limit
+     (quota), hard limit, and time limit.  The soft limit is the number of 1K
+     blocks (or files) that the user is expected to remain below.  The hard
+     limit cannot be exceeded.  If a user's usage reaches the hard limit,
+     further requests for space (or attempts to create a file) fail with an
+     EDQUOT/ENOSPC error.
+
+     When a user exceeds the soft limit, the timer is enabled.  Any time the
+     quota drops below the soft limits, the timer is disabled.  If the timer
+     pops, the particular limit that has been exceeded is treated as if the
+     hard limit has been reached, and no more resources are allocated to the
+     user.  The only way to reset this condition, short of turning off limit
+     enforcement or increasing the limit, is to reduce usage below quota.
+     Only the superuser can set the time limits and this is done on a per
+     filesystem basis.
+
+   Surviving When the Quota Limit Is Reached
+     In most cases, the only way for a user to recover from over-quota
+     conditions is to abort whatever activity is in progress on the filesystem
+     that has reached its limit, remove sufficient files to bring the limit
+     back below quota, and retry the failed program.
+
+     However, if a user is in the editor and a write fails because of an over
+     quota situation, that is not a suitable course of action. It is most
+     likely that initially attempting to write the file has truncated its
+     previous contents, so if the editor is aborted without correctly writing
+     the file, not only are the recent changes lost, but possibly much, or
+     even all, of the contents that previously existed.
+
+     There are several possible safe exits for a user caught in this
+     situation.  He can use the editor ! shell escape command to examine his
+     file space and remove surplus files.  Alternatively, using csh(1), he can
+     suspend the editor, remove some files, then resume it.  A third
+     possibility is to write the file to some other filesystem (perhaps to a
+     file on /tmp) where the user's quota has not been exceeded.  Then after
+     rectifying the quota situation, the file can be moved back to the
+     filesystem it belongs on.
+
+
+ADMINISTRATION
+
+Quotas is a configurable subsystem that is optionally built into the kernel.
+A decision as to which filesystems need to have quotas enabled needs to be
+made.  Usually, only filesystems that house users' home directories or other
+user files need to be subjected to the quota system.  It is recommended that
+the filesystem housing /tmp should be free of quotas.
+
+XFS and the Linux VFS quota systems (e.g. as used on ext2 filesystems) share
+many characteristics.  We begin with an overview of how the Linux VFS quota
+system is administered.
+
+   Administering the Linux VFS Quota System
+     On most filesystems, quota file(s) should be created in the root of
+     those filesystems that are to have quotas.  These files should be of
+     size zero and should be readable and writable only by root.  After
+     deciding on the filesystems that will have quotas, the administrator
+     then establishes quotas for individual users.
+     The edquota(8) and/or setquota(8) commands are used to actually set
+     the limits desired upon each user.  Where a number of users are to be
+     given the same quotas (a common occurrence) the -p option to edquota
+     allows this to be easily accomplished.  Unless explicitly given a quota,
+     users have no limits set on the amount of disk they can use or the number
+     of files they can create.
+
+     Once the quotas are set and ready to operate, the system must be informed
+     to enforce quotas on the desired filesystems.  This is accomplished with
+     the quotaon(8) command.  For quotas to be accurate, it should be enabled
+     on a local filesystem immediately after the filesystem has been mounted.
+     quotaon either enables quotas for a particular filesystem or, with the -a
+     option, enables quotas for each filesystem indicated in /etc/fstab as
+     using quotas.  See mount(8) for details.  When the quota package is
+     installed,
+
+              /usr/etc/quotaon -a
+
+     can be automatically executed during system boot up time by the startup
+     scripts.
+
+     When quotas need to be disabled, the quotaoff(8) command is used.
+     However, if the filesystem is about to be dismounted, the umount(8)
+     command disables quotas immediately before the filesystem is unmounted.
+     This is actually an effect of the umount(2) system call, and it
+     guarantees that the quota system is not disabled if the umount would fail
+     because the filesystem is not idle.
+
+     Periodically (certainly after each reboot and when quotas are first
+     enabled for a filesystem), the records retained in the quota file should
+     be checked for consistency with the actual number of blocks and files
+     allocated to the user.  The quotacheck(8) command is used to accomplish
+     this.  It is not necessary to unmount the filesystem or disable the
+     quota system to run this command, though on active filesystems inaccurate
+     results may occur.  This does no real harm in most cases; another run of
+     quotacheck when the filesystem is idle corrects any inaccuracy.  The
+     startup scripts can be configured to run quotacheck automatically.
+
+     The superuser can use the quota command to examine the usage and quotas
+     of any user, and the repquota(8) command can be used to check the usages
+     and limits for all users on a filesystem.
+
+   Administering the XFS Quota System
+     The XFS quota system is different from that of the Linux VFS in many ways.
+
+     o   There is no need for quota file(s) in the root of the XFS filesystem.
+
+     o   XFS distinguishes between quota accounting and limit enforcement.
+         Quota accounting must be turned on at the time of mounting the XFS
+         filesystem.  However, it is possible to turn on/off limit
+         enforcement any time quota accounting is turned on. The "quota"
+         option in mount(8) turns on both (user) quota accounting and
+         enforcement.  The "uqnoenforce" option must be used to turn on
+         user accounting with limit enforcement disabled.  quotaon(8)
+         contains some examples of frequently used procedures.
+
+     o   Turning on quotas on the root filesystem is slightly different from
+         the above.  quotaon(8) must be used on the root XFS filesystem
+         first; quotas will be turned on the next time the system is
+         rebooted.  It is useful to use repquota(8) with the -v option to
+         monitor the effect of quotaon/off at various stages.
+
+     o   quotacheck(8) has no effect on XFS filesystems.  The first time
+         quota accounting is turned on, XFS does an automatic quotacheck
+         internally; afterwards, the quota system will always be completely
+         consistent until quotas are manually turned off.
+
+     o   repquota(8) with the -v option can be used to monitor the status of
+         the quota system of an XFS filesystem.  This can be used to see if
+         quotas are turned on, given an XFS filesystem.  It can also be used
+         to monitor the space occupied by the quota system itself.
+
+     o   Refer to the xfsdump(8), xfsdq(8), and xfsrq(8) man pages, from the
+         xfsdump package, which describes a mechanism built into xfsdump that
+         allows quota limit information to be backed up and easily restored.
+
+     o   edquota(8) and setquota(8) cannot be used to set quota limits before
+         turning on quotas on the filesystem concerned.
+
+     o   XFS filesystems keep quota accounting on the superuser, and quota -v
+         will display the superuser's usage information.  However, limits are
+         never enforced on the superuser.
+
+     o   XFS filesystems keep quota accounting whether the user has quota
+         limits or not.
+
+
+IMPLEMENTATION NOTES
+
+     On filesystems using Linux VFS quota, disk quota usage information is
+     stored in a file on the filesystem that the quotas are to be applied to.
+     Conventionally, this file is called quotas, and resides at the root of
+     the filesystem.
+
+     The system is informed of the existence of the quota file by the quotactl
+     system call.  It then reads the quota entries for any open files owned by
+     users.  Each subsequent open of a file in the filesystem is accompanied
+     by a pairing with its quota information.
+
+     Each time a block is accessed or released and each time an inode is
+     allocated or freed, the quota system gets told about it and, in the case
+     of allocations, gets the opportunity to deny the allocation.
+
+     Note that the XFS quota system implementation is radically different
+     to the Linux VFS described above.  XFS considers quota information as
+     filesystem metadata and uses journaling to provide a higher level
+     guarantee of consistency.
+
+
+GETTING STARTED
+
+     To use quota under XFS you will need the following:
+     o   An XFS aware kernel;
+     o   Quota must be enabled at the time the kernel is built
+         (CONFIG_QUOTA, at the start of the Filesystems menu);
+     o   XFS quota must be enabled at the time XFS is built
+         (CONFIG_XFS_QUOTA, below XFS in the Filesystems menu);
+     o   Userspace quota tools which are aware of XFS quota.
+
+     User tools which support XFS can be downloaded from the Linux
+     quota project at:
+		http://sourceforge.net/projects/linuxquota/
+     The quota tools from version 3.01-pre2 onward have full support
+     for XFS.  They can be downloaded via cvs or as a source tarball.
+
+     Building the user tools from source:
+          # autoconf
+          # ./configure --prefix=/usr --mandir=/usr/share/man
+          # make
+          # make install
+
+
+EXAMPLES
+
+>>> Enabling quota enforcement on a non-root XFS filesystem
+	
+[root@troppo]# echo /dev/hdb10 /mnt/xqm xfs rw,usrquota 0 0 >>/etc/fstab
+[root@troppo]# mount /mnt/xqm
+
+>>> Set limits for a user (can also use edquota, interactively)
+
+[root@troppo]# setquota nathans /mnt/xqm 600 800 15 20
+
+>>> Report current user quota 
+
+[root@troppo]# repquota /mnt/xqm
+*** Report for user quotas on device /dev/hdb10
+Block grace time: 7days Inode grace time: 7days
+                        Block limits               File limits
+user            used    soft    hard  grace    used  soft  hard  grace
+root      --    1552       0       0             11     0     0       
+nathans   --     440     600     800              8    15    20       
+pcpqa     --     880       0       0              1     0     0       
+
+>>> Push user over quota (see "File limits" above for user "nathans")
+
+[nathans@troppo]$ sh
+sh-2.04$ for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13
+> do
+>     touch /mnt/xqm/blat/file${i}
+> done
+touch: creating `/mnt/xqm/blat/file12': Disk quota exceeded
+touch: creating `/mnt/xqm/blat/file13': Disk quota exceeded
+sh-2.04$ ^D
+
+>>> Report current user quota again
+
+[root@troppo]# repquota /mnt/xqm
+*** Report for user quotas on device /dev/hdb10
+Block grace time: 7days Inode grace time: 7days
+                        Block limits               File limits
+user            used    soft    hard  grace    used  soft  hard  grace
+root      --    1560       0       0             11     0     0       
+nathans   -+     440     600     800             20    15    20 7 days
+pcpqa     --     880       0       0              1     0     0       
+
+>>> From the users point of view:
+
+[nathans@troppo]$ quota
+quota
+Disk quotas for user nathans (uid 16302): 
+     Filesystem  blocks   quota   limit   grace   files   quota   limit   grace
+     /dev/hdb10     440     600     800              20*     15      20  7 days
+
+>>> Run warnquota(8) via cron(8) to periodically inform users of violations.
+
+
+CAVEATS
+
+The XFS allocation mechanism will always reserve the maximum amount of
+space required before proceeding with a space allocation.  If insufficient
+space for this reservation is available, due to the users block quota limit
+being reached for example, this may result in the allocation failing even
+though there is sufficient space.  Quota enforcement can thus sometimes
+happen in situations where the user is under quota and the end result of
+some operation would still have left the user under quota had the operation
+been allowed to run its course.  This is an unavoidable side of affect of
+the way XFS operates, so should be kept in mind when assigning users block
+limits.  This additional overhead is typically in the range of tens of
+filesystem-sized blocks.
+
+On IRIX, XFS supports project quota.  This is not (ever) likely to be
+supported on Linux/XFS, as the concept of a project is specific to IRIX.
+A filesystem that has used user quota on IRIX, however, can be migrated
+to Linux, and vice-versa, as the ondisk format is shared between both
+versions of XFS (and Linux/XFS is "endian clean").
+
